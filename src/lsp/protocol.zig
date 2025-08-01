@@ -16,8 +16,16 @@ pub const Message = union(enum) {
     response: types.JsonRpcResponse,
     notification: types.JsonRpcNotification,
 };
+// Global storage for parsed JSON to keep it alive
+var global_parsed_json: ?std.json.Parsed(std.json.Value) = null;
 
 pub fn readMessage(reader: anytype) !?Message {
+    // Clean up previous JSON if any
+    if (global_parsed_json) |*prev| {
+        prev.deinit();
+        global_parsed_json = null;
+    }
+
     // Read headers
     var content_length: ?usize = null;
 
@@ -48,12 +56,12 @@ pub fn readMessage(reader: anytype) !?Message {
 
     std.log.debug("Received JSON: {s}", .{content});
 
-    // Parse JSON
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch |err| {
+    // Parse JSON and keep it alive globally
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch |err| {
         std.log.err("JSON parse error: {} for content: {s}", .{ err, content });
         return ProtocolError.ParseError;
     };
-    defer parsed.deinit();
+    global_parsed_json = parsed;
 
     const json_obj = switch (parsed.value) {
         .object => |obj| obj,

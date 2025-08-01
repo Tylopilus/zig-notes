@@ -101,7 +101,7 @@ pub const WorkspaceFolder = struct {
 };
 
 pub const ServerCapabilities = struct {
-    text_document_sync: ?u8 = null,
+    text_document_sync: ?TextDocumentSyncOptions = null,
     hover_provider: ?bool = null,
     completion_provider: ?CompletionOptions = null,
     signature_help_provider: ?JsonValue = null,
@@ -124,6 +124,18 @@ pub const ServerCapabilities = struct {
 pub const CompletionOptions = struct {
     resolve_provider: ?bool = null,
     trigger_characters: ?[]const []const u8 = null,
+};
+
+pub const TextDocumentSyncOptions = struct {
+    openClose: ?bool = null,
+    change: ?u8 = null,
+    willSave: ?bool = null,
+    willSaveWaitUntil: ?bool = null,
+    save: ?SaveOptions = null,
+};
+
+pub const SaveOptions = struct {
+    includeText: ?bool = null,
 };
 
 pub const InitializeResult = struct {
@@ -161,3 +173,10 @@ pub const JsonRpcNotification = struct {
     method: []const u8,
     params: ?JsonValue = null,
 };
+
+pub const TextDocumentPositionParams = struct {
+    text_document: TextDocumentIdentifier,
+    position: Position,
+};
+
+pub const DefinitionParams = TextDocumentPositionParams;

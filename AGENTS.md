@@ -19,6 +19,8 @@
 - Indentation: 4 spaces, no tabs
 - Braces: Opening brace on same line for functions/structs
 - Documentation: Use `///` for public APIs, `//` for internal comments
+- Defer cleanup: Always use `defer` for resource cleanup
+- Logging: Use `std.log` for debug/info/error messages
 
 ## Testing
 - Place tests in the same file as the code being tested

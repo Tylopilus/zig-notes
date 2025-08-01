@@ -2,6 +2,8 @@ const std = @import("std");
 const types = @import("types.zig");
 const protocol = @import("protocol.zig");
 const discovery = @import("../markdown/discovery.zig");
+const file_index = @import("file_index.zig");
+const document_manager = @import("document_manager.zig");
 const allocator = @import("../utils/allocator.zig").allocator;
 
 pub const LspServer = struct {
@@ -9,10 +11,14 @@ pub const LspServer = struct {
     shutdown_requested: bool = false,
     workspace_path: ?[]const u8 = null,
     markdown_files: std.ArrayList(discovery.MarkdownFile),
+    file_index: file_index.FileIndex,
+    document_manager: document_manager.DocumentManager,
 
     pub fn init() LspServer {
         return LspServer{
             .markdown_files = std.ArrayList(discovery.MarkdownFile).init(allocator),
+            .file_index = file_index.FileIndex.init(),
+            .document_manager = document_manager.DocumentManager.init(),
         };
     }
 
@@ -21,6 +27,8 @@ pub const LspServer = struct {
             file.deinit();
         }
         self.markdown_files.deinit();
+        self.file_index.deinit();
+        self.document_manager.deinit();
 
         if (self.workspace_path) |path| {
             allocator.free(path);
@@ -40,6 +48,8 @@ pub const LspServer = struct {
             try self.handleInitialize(writer, request);
         } else if (std.mem.eql(u8, request.method, "shutdown")) {
             try self.handleShutdown(writer, request);
+        } else if (std.mem.eql(u8, request.method, "textDocument/definition")) {
+            try self.handleDefinition(writer, request);
         } else {
             try protocol.writeError(writer, request.id, -32601, "Method not found");
         }
@@ -70,11 +80,24 @@ pub const LspServer = struct {
                 std.log.warn("Failed to discover markdown files: {}", .{err});
                 break :blk std.ArrayList(discovery.MarkdownFile).init(allocator);
             };
+
+            // Build file index
+            for (self.markdown_files.items) |markdown_file| {
+                self.file_index.addFile(markdown_file.path) catch |err| {
+                    std.log.warn("Failed to add file to index: {} - {s}", .{ err, markdown_file.path });
+                };
+            }
         }
 
         const trigger_chars = [_][]const u8{ "[", "#" };
         const server_capabilities = types.ServerCapabilities{
-            .text_document_sync = 1, // Full sync
+            .text_document_sync = types.TextDocumentSyncOptions{
+                .openClose = true,
+                .change = 1, // Full sync
+                .willSave = false,
+                .willSaveWaitUntil = false,
+                .save = types.SaveOptions{ .includeText = false },
+            },
             .hover_provider = true,
             .completion_provider = types.CompletionOptions{
                 .resolve_provider = false,
@@ -96,7 +119,9 @@ pub const LspServer = struct {
             .server_info = server_info,
         };
 
+        std.log.debug("Sending initialize response with capabilities", .{});
         try protocol.writeResponse(writer, request.id, result);
+        std.log.debug("Initialize response sent successfully", .{});
     }
 
     fn handleInitialized(self: *LspServer, writer: anytype, notification: types.JsonRpcNotification) !void {
@@ -112,26 +137,249 @@ pub const LspServer = struct {
     }
 
     fn handleDidOpen(self: *LspServer, writer: anytype, notification: types.JsonRpcNotification) !void {
-        _ = self;
         _ = writer;
-        _ = notification;
-        // Stub implementation - just log that we received the notification
-        std.log.debug("Received textDocument/didOpen notification", .{});
+        if (notification.params) |params| {
+            if (parseDidOpenParams(params)) |did_open_params| {
+                try self.document_manager.didOpen(
+                    did_open_params.text_document.uri,
+                    did_open_params.text_document.text,
+                    did_open_params.text_document.version,
+                );
+                std.log.debug("Opened document: {s}", .{did_open_params.text_document.uri});
+            } else |err| {
+                std.log.warn("Failed to parse didOpen params: {}", .{err});
+            }
+        }
     }
 
     fn handleDidClose(self: *LspServer, writer: anytype, notification: types.JsonRpcNotification) !void {
-        _ = self;
         _ = writer;
-        _ = notification;
-        // Stub implementation - just log that we received the notification
-        std.log.debug("Received textDocument/didClose notification", .{});
+        if (notification.params) |params| {
+            if (parseDidCloseParams(params)) |did_close_params| {
+                self.document_manager.didClose(did_close_params.text_document.uri);
+                std.log.debug("Closed document: {s}", .{did_close_params.text_document.uri});
+            } else |err| {
+                std.log.warn("Failed to parse didClose params: {}", .{err});
+            }
+        }
     }
 
     fn handleDidChange(self: *LspServer, writer: anytype, notification: types.JsonRpcNotification) !void {
-        _ = self;
         _ = writer;
-        _ = notification;
-        // Stub implementation - just log that we received the notification
-        std.log.debug("Received textDocument/didChange notification", .{});
+        if (notification.params) |params| {
+            if (parseDidChangeParams(params)) |did_change_params| {
+                // For full sync, we expect one change event with the full text
+                if (did_change_params.content_changes.len > 0) {
+                    const change = did_change_params.content_changes[0];
+                    try self.document_manager.didChange(
+                        did_change_params.text_document.uri,
+                        change.text,
+                        did_change_params.text_document.version orelse 0,
+                    );
+                    std.log.debug("Changed document: {s}", .{did_change_params.text_document.uri});
+                }
+            } else |err| {
+                std.log.warn("Failed to parse didChange params: {}", .{err});
+            }
+        }
+    }
+
+    fn handleDefinition(self: *LspServer, writer: anytype, request: types.JsonRpcRequest) !void {
+        if (request.params) |params| {
+            if (parseDefinitionParams(params)) |def_params| {
+                // Check if cursor is on a wikilink
+                if (self.document_manager.getWikilinkAtPosition(def_params.text_document.uri, def_params.position)) |wikilink| {
+                    // Resolve wikilink to file path
+                    if (self.file_index.resolveWikilink(wikilink.target)) |target_path| {
+                        const target_uri = try document_manager.pathToUri(target_path);
+                        defer allocator.free(target_uri);
+
+                        const location = types.Location{
+                            .uri = target_uri,
+                            .range = types.Range{
+                                .start = types.Position{ .line = 0, .character = 0 },
+                                .end = types.Position{ .line = 0, .character = 0 },
+                            },
+                        };
+
+                        try protocol.writeResponse(writer, request.id, location);
+                        return;
+                    }
+                }
+
+                // No definition found
+                try protocol.writeResponse(writer, request.id, null);
+            } else |err| {
+                std.log.warn("Failed to parse definition params: {}", .{err});
+                try protocol.writeError(writer, request.id, -32602, "Invalid params");
+            }
+        } else {
+            try protocol.writeError(writer, request.id, -32602, "Invalid params");
+        }
     }
 };
+
+fn parseDidOpenParams(params: std.json.Value) !types.DidOpenTextDocumentParams {
+    const obj = switch (params) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const text_document_value = obj.get("textDocument") orelse return error.InvalidParams;
+    const text_document_obj = switch (text_document_value) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const uri = switch (text_document_obj.get("uri") orelse return error.InvalidParams) {
+        .string => |s| s,
+        else => return error.InvalidParams,
+    };
+
+    const language_id = switch (text_document_obj.get("languageId") orelse return error.InvalidParams) {
+        .string => |s| s,
+        else => return error.InvalidParams,
+    };
+
+    const version = switch (text_document_obj.get("version") orelse return error.InvalidParams) {
+        .integer => |i| @as(i32, @intCast(i)),
+        else => return error.InvalidParams,
+    };
+
+    const text = switch (text_document_obj.get("text") orelse return error.InvalidParams) {
+        .string => |s| s,
+        else => return error.InvalidParams,
+    };
+
+    return types.DidOpenTextDocumentParams{
+        .text_document = types.TextDocumentItem{
+            .uri = uri,
+            .language_id = language_id,
+            .version = version,
+            .text = text,
+        },
+    };
+}
+
+fn parseDidCloseParams(params: std.json.Value) !types.DidCloseTextDocumentParams {
+    const obj = switch (params) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const text_document_value = obj.get("textDocument") orelse return error.InvalidParams;
+    const text_document_obj = switch (text_document_value) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const uri = switch (text_document_obj.get("uri") orelse return error.InvalidParams) {
+        .string => |s| s,
+        else => return error.InvalidParams,
+    };
+
+    return types.DidCloseTextDocumentParams{
+        .text_document = types.TextDocumentIdentifier{
+            .uri = uri,
+        },
+    };
+}
+
+fn parseDidChangeParams(params: std.json.Value) !types.DidChangeTextDocumentParams {
+    const obj = switch (params) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const text_document_value = obj.get("textDocument") orelse return error.InvalidParams;
+    const text_document_obj = switch (text_document_value) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const uri = switch (text_document_obj.get("uri") orelse return error.InvalidParams) {
+        .string => |s| s,
+        else => return error.InvalidParams,
+    };
+
+    const version = if (text_document_obj.get("version")) |v| switch (v) {
+        .integer => |i| @as(i32, @intCast(i)),
+        .null => null,
+        else => return error.InvalidParams,
+    } else null;
+
+    const content_changes_value = obj.get("contentChanges") orelse return error.InvalidParams;
+    const content_changes_array = switch (content_changes_value) {
+        .array => |a| a,
+        else => return error.InvalidParams,
+    };
+
+    var content_changes = try allocator.alloc(types.TextDocumentContentChangeEvent, content_changes_array.items.len);
+    for (content_changes_array.items, 0..) |change_value, i| {
+        const change_obj = switch (change_value) {
+            .object => |o| o,
+            else => return error.InvalidParams,
+        };
+
+        const text = switch (change_obj.get("text") orelse return error.InvalidParams) {
+            .string => |s| s,
+            else => return error.InvalidParams,
+        };
+
+        content_changes[i] = types.TextDocumentContentChangeEvent{
+            .text = text,
+        };
+    }
+
+    return types.DidChangeTextDocumentParams{
+        .text_document = types.VersionedTextDocumentIdentifier{
+            .uri = uri,
+            .version = version,
+        },
+        .content_changes = content_changes,
+    };
+}
+
+fn parseDefinitionParams(params: std.json.Value) !types.DefinitionParams {
+    const obj = switch (params) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const text_document_value = obj.get("textDocument") orelse return error.InvalidParams;
+    const text_document_obj = switch (text_document_value) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const uri = switch (text_document_obj.get("uri") orelse return error.InvalidParams) {
+        .string => |s| s,
+        else => return error.InvalidParams,
+    };
+
+    const position_value = obj.get("position") orelse return error.InvalidParams;
+    const position_obj = switch (position_value) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const line = switch (position_obj.get("line") orelse return error.InvalidParams) {
+        .integer => |i| @as(u32, @intCast(i)),
+        else => return error.InvalidParams,
+    };
+
+    const character = switch (position_obj.get("character") orelse return error.InvalidParams) {
+        .integer => |i| @as(u32, @intCast(i)),
+        else => return error.InvalidParams,
+    };
+
+    return types.DefinitionParams{
+        .text_document = types.TextDocumentIdentifier{
+            .uri = uri,
+        },
+        .position = types.Position{
+            .line = line,
+            .character = character,
+        },
+    };
+}
