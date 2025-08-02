@@ -4,6 +4,7 @@ const protocol = @import("protocol.zig");
 const discovery = @import("../markdown/discovery.zig");
 const file_index = @import("file_index.zig");
 const document_manager = @import("document_manager.zig");
+const fuzzy = @import("fuzzy.zig");
 const allocator = @import("../utils/allocator.zig").allocator;
 
 pub const LspServer = struct {
@@ -233,17 +234,19 @@ pub const LspServer = struct {
                 // Check if we're in a wikilink context
                 if (self.document_manager.getDocument(completion_params.textDocument.uri)) |document| {
                     if (self.isWikilinkContext(document.content, completion_params.position)) {
-                        // Generate completion items from file index
-                        var completion_items = std.ArrayList(types.CompletionItem).init(allocator);
+                        // Extract query from the wikilink
+                        const query = self.extractWikilinkQuery(document.content, completion_params.position) catch "";
+                        defer if (query.len > 0) allocator.free(query);
+                        
+                        // Collect all candidate filenames
+                        var candidates = std.ArrayList([]const u8).init(allocator);
                         defer {
-                            for (completion_items.items) |*item| {
-                                allocator.free(item.label);
-                                if (item.insertText) |text| allocator.free(text);
-                                if (item.detail) |detail| allocator.free(detail);
+                            for (candidates.items) |candidate| {
+                                allocator.free(candidate);
                             }
-                            completion_items.deinit();
+                            candidates.deinit();
                         }
-
+                        
                         for (self.file_index.all_files.items) |file_metadata| {
                             // Convert file path to URI for comparison
                             const file_uri = document_manager.pathToUri(file_metadata.path) catch continue;
@@ -254,15 +257,52 @@ pub const LspServer = struct {
 
                             // Get the filename with extension
                             const filename = std.fs.path.basename(file_metadata.path);
-                            const insert_text = try std.fmt.allocPrint(allocator, "{s}]]", .{filename});
-                            const detail = try allocator.dupe(u8, file_metadata.path);
+                            try candidates.append(try allocator.dupe(u8, filename));
+                        }
+                        
+                        // Use fuzzy matching to filter and sort candidates
+                        const fuzzy_matches = try fuzzy.fuzzyMatch(query, candidates.items, 20);
+                        defer fuzzy.freeFuzzyMatches(fuzzy_matches);
+                        
+                        // Generate completion items from fuzzy matches
+                        var completion_items = std.ArrayList(types.CompletionItem).init(allocator);
+                        defer {
+                            for (completion_items.items) |*item| {
+                                allocator.free(item.label);
+                                if (item.insertText) |text| allocator.free(text);
+                                if (item.detail) |detail| allocator.free(detail);
+                                if (item.textEdit) |textEdit| allocator.free(textEdit.newText);
+                                if (item.filterText) |filter| allocator.free(filter);
+                            }
+                            completion_items.deinit();
+                        }
+
+                        for (fuzzy_matches) |match| {
+                            // Find the original file metadata for details
+                            var detail_path: ?[]const u8 = null;
+                            for (self.file_index.all_files.items) |file_metadata| {
+                                const filename = std.fs.path.basename(file_metadata.path);
+                                if (std.mem.eql(u8, filename, match.text)) {
+                                    detail_path = file_metadata.path;
+                                    break;
+                                }
+                            }
+                            
+                            // Create text edit that replaces from after [[ to cursor position
+                            const query_range = try self.getWikilinkQueryRange(document.content, completion_params.position);
+                            const new_text = try std.fmt.allocPrint(allocator, "{s}]]", .{match.text});
+                            
+                            const text_edit = types.TextEdit{
+                                .range = query_range,
+                                .newText = new_text,
+                            };
 
                             const item = types.CompletionItem{
-                                .label = try allocator.dupe(u8, filename),
+                                .label = try allocator.dupe(u8, match.text),
                                 .kind = 17, // File completion kind
-                                .detail = detail,
-                                .insertText = insert_text,
-                                .filterText = try allocator.dupe(u8, filename),
+                                .detail = if (detail_path) |path| try allocator.dupe(u8, path) else null,
+                                .textEdit = text_edit,
+                                .filterText = try allocator.dupe(u8, match.text),
                             };
                             try completion_items.append(item);
                         }
@@ -328,6 +368,152 @@ pub const LspServer = struct {
         }
         
         return false; // No [[ found
+    }
+
+    fn extractWikilinkQuery(self: *LspServer, content: []const u8, position: types.Position) ![]const u8 {
+        _ = self;
+        
+        // Convert position to byte offset
+        var line: u32 = 0;
+        var character: u32 = 0;
+        var cursor_offset: usize = 0;
+        
+        for (content, 0..) |c, i| {
+            if (line == position.line and character == position.character) {
+                cursor_offset = i;
+                break;
+            }
+            if (c == '\n') {
+                line += 1;
+                character = 0;
+            } else {
+                character += 1;
+            }
+        }
+        
+        // Find the start of the current wikilink [[
+        var start_offset: ?usize = null;
+        var i = cursor_offset;
+        while (i >= 2) {
+            i -= 1;
+            if (i + 1 < content.len and content[i] == '[' and content[i + 1] == '[') {
+                start_offset = i + 2; // Start after [[
+                break;
+            }
+        }
+        
+        if (start_offset == null) {
+            return try allocator.dupe(u8, ""); // No [[ found
+        }
+        
+        // Extract text between [[ and cursor position
+        const query_start = start_offset.?;
+        if (cursor_offset <= query_start) {
+            return try allocator.dupe(u8, ""); // Cursor is before or at [[
+        }
+        
+        // Check if there's a pipe character (alias separator) before cursor
+        var query_end = cursor_offset;
+        for (content[query_start..cursor_offset], query_start..) |c, idx| {
+            if (c == '|') {
+                query_end = idx;
+                break;
+            }
+        }
+        
+        const query = content[query_start..query_end];
+        return try allocator.dupe(u8, query);
+    }
+
+    fn getWikilinkQueryRange(self: *LspServer, content: []const u8, position: types.Position) !types.Range {
+        _ = self;
+        
+        // Convert position to byte offset
+        var line: u32 = 0;
+        var character: u32 = 0;
+        var cursor_offset: usize = 0;
+        
+        for (content, 0..) |c, i| {
+            if (line == position.line and character == position.character) {
+                cursor_offset = i;
+                break;
+            }
+            if (c == '\n') {
+                line += 1;
+                character = 0;
+            } else {
+                character += 1;
+            }
+        }
+        
+        // Find the start of the current wikilink [[
+        var start_offset: ?usize = null;
+        var start_line: u32 = 0;
+        var start_char: u32 = 0;
+        
+        var i = cursor_offset;
+        var temp_line = position.line;
+        var temp_char = position.character;
+        
+        while (i >= 2) {
+            i -= 1;
+            if (temp_char == 0) {
+                temp_line -= 1;
+                // Find the length of the previous line
+                var prev_line_len: u32 = 0;
+                var j = i;
+                while (j > 0 and content[j] != '\n') {
+                    j -= 1;
+                    prev_line_len += 1;
+                }
+                temp_char = prev_line_len;
+            } else {
+                temp_char -= 1;
+            }
+            
+            if (i + 1 < content.len and content[i] == '[' and content[i + 1] == '[') {
+                start_offset = i + 2; // Start after [[
+                start_line = temp_line;
+                start_char = temp_char + 2;
+                break;
+            }
+        }
+        
+        if (start_offset == null) {
+            // Fallback: replace from cursor position
+            return types.Range{
+                .start = position,
+                .end = position,
+            };
+        }
+        
+        // Check if there's a pipe character (alias separator) before cursor
+        var query_end_line = position.line;
+        var query_end_char = position.character;
+        
+        for (content[start_offset.?..cursor_offset], start_offset.?..) |c, idx| {
+            if (c == '|') {
+                // Convert byte offset back to line/character
+                var calc_line: u32 = 0;
+                var calc_char: u32 = 0;
+                for (content[0..idx]) |byte| {
+                    if (byte == '\n') {
+                        calc_line += 1;
+                        calc_char = 0;
+                    } else {
+                        calc_char += 1;
+                    }
+                }
+                query_end_line = calc_line;
+                query_end_char = calc_char;
+                break;
+            }
+        }
+        
+        return types.Range{
+            .start = types.Position{ .line = start_line, .character = start_char },
+            .end = types.Position{ .line = query_end_line, .character = query_end_char },
+        };
     }
 };
 

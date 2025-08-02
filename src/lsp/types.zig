@@ -200,6 +200,12 @@ pub const CompletionItem = struct {
     insertText: ?[]const u8 = null,
     filterText: ?[]const u8 = null,
     sortText: ?[]const u8 = null,
+    textEdit: ?TextEdit = null,
+};
+
+pub const TextEdit = struct {
+    range: Range,
+    newText: []const u8,
 };
 
 pub const CompletionList = struct {
