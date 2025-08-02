@@ -101,29 +101,29 @@ pub const WorkspaceFolder = struct {
 };
 
 pub const ServerCapabilities = struct {
-    text_document_sync: ?TextDocumentSyncOptions = null,
-    hover_provider: ?bool = null,
-    completion_provider: ?CompletionOptions = null,
-    signature_help_provider: ?JsonValue = null,
-    definition_provider: ?bool = null,
-    references_provider: ?bool = null,
-    document_highlight_provider: ?bool = null,
-    document_symbol_provider: ?bool = null,
-    workspace_symbol_provider: ?bool = null,
-    code_action_provider: ?bool = null,
-    code_lens_provider: ?JsonValue = null,
-    document_formatting_provider: ?bool = null,
-    document_range_formatting_provider: ?bool = null,
-    document_on_type_formatting_provider: ?JsonValue = null,
-    rename_provider: ?bool = null,
-    document_link_provider: ?JsonValue = null,
-    execute_command_provider: ?JsonValue = null,
+    textDocumentSync: ?TextDocumentSyncOptions = null,
+    hoverProvider: ?bool = null,
+    completionProvider: ?CompletionOptions = null,
+    signatureHelpProvider: ?JsonValue = null,
+    definitionProvider: ?bool = null,
+    referencesProvider: ?bool = null,
+    documentHighlightProvider: ?bool = null,
+    documentSymbolProvider: ?bool = null,
+    workspaceSymbolProvider: ?bool = null,
+    codeActionProvider: ?bool = null,
+    codeLensProvider: ?JsonValue = null,
+    documentFormattingProvider: ?bool = null,
+    documentRangeFormattingProvider: ?bool = null,
+    documentOnTypeFormattingProvider: ?JsonValue = null,
+    renameProvider: ?bool = null,
+    documentLinkProvider: ?JsonValue = null,
+    executeCommandProvider: ?JsonValue = null,
     experimental: ?JsonValue = null,
 };
 
 pub const CompletionOptions = struct {
-    resolve_provider: ?bool = null,
-    trigger_characters: ?[]const []const u8 = null,
+    resolveProvider: ?bool = null,
+    triggerCharacters: ?[]const []const u8 = null,
 };
 
 pub const TextDocumentSyncOptions = struct {

@@ -91,22 +91,22 @@ pub const LspServer = struct {
 
         const trigger_chars = [_][]const u8{ "[", "#" };
         const server_capabilities = types.ServerCapabilities{
-            .text_document_sync = types.TextDocumentSyncOptions{
+            .textDocumentSync = types.TextDocumentSyncOptions{
                 .openClose = true,
                 .change = 1, // Full sync
                 .willSave = false,
                 .willSaveWaitUntil = false,
                 .save = types.SaveOptions{ .includeText = false },
             },
-            .hover_provider = true,
-            .completion_provider = types.CompletionOptions{
-                .resolve_provider = false,
-                .trigger_characters = &trigger_chars,
+            .hoverProvider = true,
+            .completionProvider = types.CompletionOptions{
+                .resolveProvider = false,
+                .triggerCharacters = &trigger_chars,
             },
-            .definition_provider = true,
-            .references_provider = true,
-            .document_symbol_provider = true,
-            .rename_provider = true,
+            .definitionProvider = true,
+            .referencesProvider = true,
+            .documentSymbolProvider = true,
+            .renameProvider = true,
         };
 
         const server_info = types.ServerInfo{
@@ -191,7 +191,14 @@ pub const LspServer = struct {
                 if (self.document_manager.getWikilinkAtPosition(def_params.text_document.uri, def_params.position)) |wikilink| {
                     // Resolve wikilink to file path
                     if (self.file_index.resolveWikilink(wikilink.target)) |target_path| {
-                        const target_uri = try document_manager.pathToUri(target_path);
+                        // Convert relative path to absolute path
+                        const absolute_path = if (std.fs.path.isAbsolute(target_path)) 
+                            try allocator.dupe(u8, target_path)
+                        else 
+                            try std.fs.cwd().realpathAlloc(allocator, target_path);
+                        defer allocator.free(absolute_path);
+                        
+                        const target_uri = try document_manager.pathToUri(absolute_path);
                         defer allocator.free(target_uri);
 
                         const location = types.Location{
