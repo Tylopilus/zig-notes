@@ -50,6 +50,8 @@ pub const LspServer = struct {
             try self.handleShutdown(writer, request);
         } else if (std.mem.eql(u8, request.method, "textDocument/definition")) {
             try self.handleDefinition(writer, request);
+        } else if (std.mem.eql(u8, request.method, "textDocument/completion")) {
+            try self.handleCompletion(writer, request);
         } else {
             try protocol.writeError(writer, request.id, -32601, "Method not found");
         }
@@ -224,6 +226,109 @@ pub const LspServer = struct {
             try protocol.writeError(writer, request.id, -32602, "Invalid params");
         }
     }
+
+    fn handleCompletion(self: *LspServer, writer: anytype, request: types.JsonRpcRequest) !void {
+        if (request.params) |params| {
+            if (parseCompletionParams(params)) |completion_params| {
+                // Check if we're in a wikilink context
+                if (self.document_manager.getDocument(completion_params.textDocument.uri)) |document| {
+                    if (self.isWikilinkContext(document.content, completion_params.position)) {
+                        // Generate completion items from file index
+                        var completion_items = std.ArrayList(types.CompletionItem).init(allocator);
+                        defer {
+                            for (completion_items.items) |*item| {
+                                allocator.free(item.label);
+                                if (item.insertText) |text| allocator.free(text);
+                                if (item.detail) |detail| allocator.free(detail);
+                            }
+                            completion_items.deinit();
+                        }
+
+                        for (self.file_index.all_files.items) |file_metadata| {
+                            // Convert file path to URI for comparison
+                            const file_uri = document_manager.pathToUri(file_metadata.path) catch continue;
+                            defer allocator.free(file_uri);
+                            
+                            // Skip the current file
+                            if (std.mem.eql(u8, file_uri, completion_params.textDocument.uri)) continue;
+
+                            // Get the filename with extension
+                            const filename = std.fs.path.basename(file_metadata.path);
+                            const insert_text = try std.fmt.allocPrint(allocator, "{s}]]", .{filename});
+                            const detail = try allocator.dupe(u8, file_metadata.path);
+
+                            const item = types.CompletionItem{
+                                .label = try allocator.dupe(u8, filename),
+                                .kind = 17, // File completion kind
+                                .detail = detail,
+                                .insertText = insert_text,
+                                .filterText = try allocator.dupe(u8, filename),
+                            };
+                            try completion_items.append(item);
+                        }
+
+                        const completion_list = types.CompletionList{
+                            .isIncomplete = false,
+                            .items = try allocator.dupe(types.CompletionItem, completion_items.items),
+                        };
+                        defer allocator.free(completion_list.items);
+
+                        try protocol.writeResponse(writer, request.id, completion_list);
+                        return;
+                    }
+                }
+
+                // No completion available
+                const empty_list = types.CompletionList{
+                    .isIncomplete = false,
+                    .items = &[_]types.CompletionItem{},
+                };
+                try protocol.writeResponse(writer, request.id, empty_list);
+            } else |err| {
+                std.log.warn("Failed to parse completion params: {}", .{err});
+                try protocol.writeError(writer, request.id, -32602, "Invalid params");
+            }
+        } else {
+            try protocol.writeError(writer, request.id, -32602, "Invalid params");
+        }
+    }
+
+    fn isWikilinkContext(self: *LspServer, content: []const u8, position: types.Position) bool {
+        _ = self;
+        // Look backwards from cursor position to find [[ without matching ]]
+        
+        // Convert position to byte offset
+        var line: u32 = 0;
+        var character: u32 = 0;
+        var cursor_offset: usize = 0;
+        
+        for (content, 0..) |c, i| {
+            if (line == position.line and character == position.character) {
+                cursor_offset = i;
+                break;
+            }
+            if (c == '\n') {
+                line += 1;
+                character = 0;
+            } else {
+                character += 1;
+            }
+        }
+        
+        // Look backwards from cursor to find the most recent [[ or ]]
+        var i = cursor_offset;
+        while (i >= 2) {
+            i -= 1;
+            if (i + 1 < content.len and content[i] == '[' and content[i + 1] == '[') {
+                return true; // Found opening [[
+            }
+            if (i + 1 < content.len and content[i] == ']' and content[i + 1] == ']') {
+                return false; // Found closing ]]
+            }
+        }
+        
+        return false; // No [[ found
+    }
 };
 
 fn parseDidOpenParams(params: std.json.Value) !types.DidOpenTextDocumentParams {
@@ -382,6 +487,50 @@ fn parseDefinitionParams(params: std.json.Value) !types.DefinitionParams {
 
     return types.DefinitionParams{
         .text_document = types.TextDocumentIdentifier{
+            .uri = uri,
+        },
+        .position = types.Position{
+            .line = line,
+            .character = character,
+        },
+    };
+}
+
+fn parseCompletionParams(params: std.json.Value) !types.CompletionParams {
+    const obj = switch (params) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const text_document_value = obj.get("textDocument") orelse return error.InvalidParams;
+    const text_document_obj = switch (text_document_value) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const uri = switch (text_document_obj.get("uri") orelse return error.InvalidParams) {
+        .string => |s| s,
+        else => return error.InvalidParams,
+    };
+
+    const position_value = obj.get("position") orelse return error.InvalidParams;
+    const position_obj = switch (position_value) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const line = switch (position_obj.get("line") orelse return error.InvalidParams) {
+        .integer => |i| @as(u32, @intCast(i)),
+        else => return error.InvalidParams,
+    };
+
+    const character = switch (position_obj.get("character") orelse return error.InvalidParams) {
+        .integer => |i| @as(u32, @intCast(i)),
+        else => return error.InvalidParams,
+    };
+
+    return types.CompletionParams{
+        .textDocument = types.TextDocumentIdentifier{
             .uri = uri,
         },
         .position = types.Position{

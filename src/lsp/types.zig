@@ -180,3 +180,29 @@ pub const TextDocumentPositionParams = struct {
 };
 
 pub const DefinitionParams = TextDocumentPositionParams;
+
+pub const CompletionParams = struct {
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+    context: ?CompletionContext = null,
+};
+
+pub const CompletionContext = struct {
+    triggerKind: u8,
+    triggerCharacter: ?[]const u8 = null,
+};
+
+pub const CompletionItem = struct {
+    label: []const u8,
+    kind: ?u8 = null,
+    detail: ?[]const u8 = null,
+    documentation: ?[]const u8 = null,
+    insertText: ?[]const u8 = null,
+    filterText: ?[]const u8 = null,
+    sortText: ?[]const u8 = null,
+};
+
+pub const CompletionList = struct {
+    isIncomplete: bool = false,
+    items: []CompletionItem,
+};
