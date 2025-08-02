@@ -157,7 +157,7 @@ pub const LspServer = struct {
         _ = writer;
         _ = notification;
         self.initialized = true;
-        
+
         // Initialize file watcher if we have a workspace
         if (self.workspace_path) |workspace| {
             self.file_watcher = file_watcher.FileWatcher.init(workspace);
@@ -177,7 +177,7 @@ pub const LspServer = struct {
                     did_open_params.text_document.text,
                     did_open_params.text_document.version,
                 );
-                
+
                 // Validate links and publish diagnostics
                 try self.validateAndPublishDiagnostics(writer, did_open_params.text_document.uri);
             } else |err| {
@@ -208,18 +208,18 @@ pub const LspServer = struct {
                         change.text,
                         did_change_params.text_document.version orelse 0,
                     );
-                    
+
                     // Update tag index with new content
                     const file_path = document_manager.uriToPath(did_change_params.text_document.uri) catch |err| {
                         std.log.warn("Failed to convert URI to path for tag indexing: {}", .{err});
                         return;
                     };
                     defer allocator.free(file_path);
-                    
+
                     self.tag_index.addTagsFromFile(file_path, change.text) catch |err| {
                         std.log.warn("Failed to update tag index: {}", .{err});
                     };
-                    
+
                     // Validate links and publish diagnostics
                     try self.validateAndPublishDiagnostics(writer, did_change_params.text_document.uri);
                 }
@@ -248,12 +248,12 @@ pub const LspServer = struct {
                     // Resolve wikilink to file path
                     if (self.file_index.resolveWikilink(wikilink.target)) |target_path| {
                         // Convert relative path to absolute path
-                        const absolute_path = if (std.fs.path.isAbsolute(target_path)) 
+                        const absolute_path = if (std.fs.path.isAbsolute(target_path))
                             try allocator.dupe(u8, target_path)
-                        else 
+                        else
                             try std.fs.cwd().realpathAlloc(allocator, target_path);
                         defer allocator.free(absolute_path);
-                        
+
                         const target_uri = try document_manager.pathToUri(absolute_path);
                         defer allocator.free(target_uri);
 
@@ -282,9 +282,9 @@ pub const LspServer = struct {
     }
 
     const CompletionContext = enum {
-        wikilink,  // Inside [[...]]
-        tag,       // In frontmatter tags array
-        none,      // No special context
+        wikilink, // Inside [[...]]
+        tag, // In frontmatter tags array
+        none, // No special context
     };
 
     fn detectCompletionContext(self: *LspServer, content: []const u8, position: types.Position) CompletionContext {
@@ -292,12 +292,12 @@ pub const LspServer = struct {
         if (self.isWikilinkContext(content, position)) {
             return .wikilink;
         }
-        
+
         // Check for frontmatter tags context
         if (frontmatter.getTagsLineInfo(content, position)) |_| {
             return .tag;
         }
-        
+
         return .none;
     }
 
@@ -305,33 +305,38 @@ pub const LspServer = struct {
         // Extract query from the wikilink
         const query = self.extractWikilinkQuery(document.content, completion_params.position) catch "";
         defer if (query.len > 0) allocator.free(query);
-        
+
         // Collect all candidate filenames
         var candidates = std.ArrayList([]const u8).init(allocator);
+        var unique_filenames = std.StringHashMap(void).init(allocator);
         defer {
             for (candidates.items) |candidate| {
                 allocator.free(candidate);
             }
             candidates.deinit();
+            unique_filenames.deinit();
         }
-        
+
         for (self.file_index.all_files.items) |file_metadata| {
             // Convert file path to URI for comparison
             const file_uri = document_manager.pathToUri(file_metadata.path) catch continue;
             defer allocator.free(file_uri);
-            
+
             // Skip the current file
             if (std.mem.eql(u8, file_uri, completion_params.textDocument.uri)) continue;
 
             // Get the filename with extension
             const filename = std.fs.path.basename(file_metadata.path);
-            try candidates.append(try allocator.dupe(u8, filename));
+            if (!unique_filenames.contains(filename)) {
+                try unique_filenames.put(filename, {});
+                try candidates.append(try allocator.dupe(u8, filename));
+            }
         }
-        
+
         // Use fuzzy matching to filter and sort candidates
         const fuzzy_matches = try fuzzy.fuzzyMatch(query, candidates.items, 20);
         defer fuzzy.freeFuzzyMatches(fuzzy_matches);
-        
+
         // Generate completion items from fuzzy matches
         var completion_items = std.ArrayList(types.CompletionItem).init(allocator);
         defer completion_items.deinit();
@@ -346,11 +351,11 @@ pub const LspServer = struct {
                     break;
                 }
             }
-            
+
             // Create text edit that replaces from after [[ to cursor position
             const query_range = try self.getWikilinkQueryRange(document.content, completion_params.position);
             const new_text = try std.fmt.allocPrint(allocator, "{s}]]", .{match.text});
-            
+
             const text_edit = types.TextEdit{
                 .range = query_range,
                 .newText = new_text,
@@ -376,7 +381,7 @@ pub const LspServer = struct {
         // Extract tag prefix
         const prefix = self.extractTagPrefix(document.content, completion_params.position) catch "";
         defer if (prefix.len > 0) allocator.free(prefix);
-        
+
         // Get all tags for fuzzy matching
         const all_tags = try self.tag_index.getAllTags();
         defer {
@@ -385,11 +390,11 @@ pub const LspServer = struct {
             }
             allocator.free(all_tags);
         }
-        
+
         // Use fuzzy matching to filter and sort tags
         const fuzzy_matches = try fuzzy.fuzzyMatch(prefix, all_tags, 20);
         defer fuzzy.freeFuzzyMatches(fuzzy_matches);
-        
+
         // Generate completion items
         var completion_items = std.ArrayList(types.CompletionItem).init(allocator);
         defer completion_items.deinit();
@@ -397,7 +402,7 @@ pub const LspServer = struct {
         for (fuzzy_matches) |match| {
             const file_count = self.tag_index.getTagCount(match.text);
             const detail = try std.fmt.allocPrint(allocator, "Used in {} files", .{file_count});
-            
+
             const item = types.CompletionItem{
                 .label = try allocator.dupe(u8, match.text),
                 .kind = 14, // Keyword completion kind
@@ -416,45 +421,46 @@ pub const LspServer = struct {
 
     fn extractTagPrefix(self: *LspServer, content: []const u8, position: types.Position) ![]const u8 {
         _ = self;
-        
+
         // Get tags line information
         const tags_info = frontmatter.getTagsLineInfo(content, position) orelse {
             return try allocator.dupe(u8, "");
         };
-        
+
         // Find current position within the tags array
         const line_content = tags_info.line_content;
         const tags_start = tags_info.tags_start;
-        
+
         // Convert position to offset within the line
         const char_offset = position.character;
-        
+
         if (char_offset < tags_start) {
             return try allocator.dupe(u8, "");
         }
-        
+
         // Find the start of the current tag being typed
         var tag_start = tags_start;
         var i = tags_start;
-        
+
         while (i < char_offset and i < line_content.len) {
             const c = line_content[i];
             if (c == ',' or c == ']') {
                 // Move past comma and whitespace to start of next tag
                 tag_start = i + 1;
-                while (tag_start < char_offset and tag_start < line_content.len and 
-                       std.ascii.isWhitespace(line_content[tag_start])) {
+                while (tag_start < char_offset and tag_start < line_content.len and
+                    std.ascii.isWhitespace(line_content[tag_start]))
+                {
                     tag_start += 1;
                 }
             }
             i += 1;
         }
-        
+
         // Extract prefix from tag start to cursor position
         if (char_offset <= tag_start) {
             return try allocator.dupe(u8, "");
         }
-        
+
         const prefix = line_content[tag_start..char_offset];
         return try allocator.dupe(u8, std.mem.trim(u8, prefix, " \t"));
     }
@@ -465,7 +471,7 @@ pub const LspServer = struct {
                 if (self.document_manager.getDocument(completion_params.textDocument.uri)) |document| {
                     // Detect completion context
                     const context = self.detectCompletionContext(document.content, completion_params.position);
-                    
+
                     switch (context) {
                         .wikilink => {
                             const completion_list = try self.completeFilenames(completion_params, document);
@@ -561,7 +567,7 @@ pub const LspServer = struct {
 
     fn generateFilePreview(self: *LspServer, file_path: []const u8) ![]const u8 {
         _ = self;
-        
+
         // Try to read the file
         const file = std.fs.openFileAbsolute(file_path, .{}) catch |err| {
             return try std.fmt.allocPrint(allocator, "**File not found**: `{s}`\n\nError: {}", .{ file_path, err });
@@ -592,11 +598,11 @@ pub const LspServer = struct {
         defer preview.deinit();
 
         try preview.writer().print("**📄 {s}**", .{filename});
-        
+
         if (file_size > preview_size) {
             try preview.writer().print(" _(showing first {}B of {}B)_", .{ preview_size, file_size });
         }
-        
+
         try preview.writer().print("\n\n---\n\n", .{});
 
         // Add the actual content
@@ -613,12 +619,12 @@ pub const LspServer = struct {
     fn isWikilinkContext(self: *LspServer, content: []const u8, position: types.Position) bool {
         _ = self;
         // Look backwards from cursor position to find [[ without matching ]]
-        
+
         // Convert position to byte offset
         var line: u32 = 0;
         var character: u32 = 0;
         var cursor_offset: usize = 0;
-        
+
         for (content, 0..) |c, i| {
             if (line == position.line and character == position.character) {
                 cursor_offset = i;
@@ -631,7 +637,7 @@ pub const LspServer = struct {
                 character += 1;
             }
         }
-        
+
         // Look backwards from cursor to find the most recent [[ or ]]
         var i = cursor_offset;
         while (i >= 2) {
@@ -643,18 +649,18 @@ pub const LspServer = struct {
                 return false; // Found closing ]]
             }
         }
-        
+
         return false; // No [[ found
     }
 
     fn extractWikilinkQuery(self: *LspServer, content: []const u8, position: types.Position) ![]const u8 {
         _ = self;
-        
+
         // Convert position to byte offset
         var line: u32 = 0;
         var character: u32 = 0;
         var cursor_offset: usize = 0;
-        
+
         for (content, 0..) |c, i| {
             if (line == position.line and character == position.character) {
                 cursor_offset = i;
@@ -667,7 +673,7 @@ pub const LspServer = struct {
                 character += 1;
             }
         }
-        
+
         // Find the start of the current wikilink [[
         var start_offset: ?usize = null;
         var i = cursor_offset;
@@ -678,17 +684,17 @@ pub const LspServer = struct {
                 break;
             }
         }
-        
+
         if (start_offset == null) {
             return try allocator.dupe(u8, ""); // No [[ found
         }
-        
+
         // Extract text between [[ and cursor position
         const query_start = start_offset.?;
         if (cursor_offset <= query_start) {
             return try allocator.dupe(u8, ""); // Cursor is before or at [[
         }
-        
+
         // Check if there's a pipe character (alias separator) before cursor
         var query_end = cursor_offset;
         for (content[query_start..cursor_offset], query_start..) |c, idx| {
@@ -697,19 +703,19 @@ pub const LspServer = struct {
                 break;
             }
         }
-        
+
         const query = content[query_start..query_end];
         return try allocator.dupe(u8, query);
     }
 
     fn getWikilinkQueryRange(self: *LspServer, content: []const u8, position: types.Position) !types.Range {
         _ = self;
-        
+
         // Convert position to byte offset
         var line: u32 = 0;
         var character: u32 = 0;
         var cursor_offset: usize = 0;
-        
+
         for (content, 0..) |c, i| {
             if (line == position.line and character == position.character) {
                 cursor_offset = i;
@@ -722,16 +728,16 @@ pub const LspServer = struct {
                 character += 1;
             }
         }
-        
+
         // Find the start of the current wikilink [[
         var start_offset: ?usize = null;
         var start_line: u32 = 0;
         var start_char: u32 = 0;
-        
+
         var i = cursor_offset;
         var temp_line = position.line;
         var temp_char = position.character;
-        
+
         while (i >= 2) {
             i -= 1;
             if (temp_char == 0) {
@@ -747,7 +753,7 @@ pub const LspServer = struct {
             } else {
                 temp_char -= 1;
             }
-            
+
             if (i + 1 < content.len and content[i] == '[' and content[i + 1] == '[') {
                 start_offset = i + 2; // Start after [[
                 start_line = temp_line;
@@ -755,7 +761,7 @@ pub const LspServer = struct {
                 break;
             }
         }
-        
+
         if (start_offset == null) {
             // Fallback: replace from cursor position
             return types.Range{
@@ -763,11 +769,11 @@ pub const LspServer = struct {
                 .end = position,
             };
         }
-        
+
         // Check if there's a pipe character (alias separator) before cursor
         var query_end_line = position.line;
         var query_end_char = position.character;
-        
+
         for (content[start_offset.?..cursor_offset], start_offset.?..) |c, idx| {
             if (c == '|') {
                 // Convert byte offset back to line/character
@@ -786,7 +792,7 @@ pub const LspServer = struct {
                 break;
             }
         }
-        
+
         return types.Range{
             .start = types.Position{ .line = start_line, .character = start_char },
             .end = types.Position{ .line = query_end_line, .character = query_end_char },
@@ -797,14 +803,14 @@ pub const LspServer = struct {
         _ = self;
         const uri_copy = try allocator.dupe(u8, uri);
         defer allocator.free(uri_copy);
-        
+
         const empty_diagnostics: []types.Diagnostic = &[_]types.Diagnostic{};
         const params = types.PublishDiagnosticsParams{
             .uri = uri_copy,
             .version = null,
             .diagnostics = empty_diagnostics,
         };
-        
+
         try protocol.writeNotification(writer, "textDocument/publishDiagnostics", params);
     }
 
@@ -812,14 +818,14 @@ pub const LspServer = struct {
         if (self.document_manager.getDocument(uri)) |document| {
             // First clear existing diagnostics
             try self.clearDiagnostics(writer, uri);
-            
+
             const diagnostics = try self.link_validator.validateDocument(&self.file_index, uri, document.wikilinks.items);
             defer self.link_validator.freeDiagnostics(diagnostics);
 
             // Create params with proper URI (ensure it's a copy for safety)
             const uri_copy = try allocator.dupe(u8, uri);
             defer allocator.free(uri_copy);
-            
+
             const params = types.PublishDiagnosticsParams{
                 .uri = uri_copy,
                 .version = document.version,
