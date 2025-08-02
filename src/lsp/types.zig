@@ -260,3 +260,13 @@ pub const PublishDiagnosticsParams = struct {
     version: ?i32 = null,
     diagnostics: []Diagnostic,
 };
+
+pub const ReferenceParams = struct {
+    text_document: TextDocumentIdentifier,
+    position: Position,
+    context: ReferenceContext,
+};
+
+pub const ReferenceContext = struct {
+    includeDeclaration: bool,
+};

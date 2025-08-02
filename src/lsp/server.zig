@@ -9,6 +9,8 @@ const fuzzy = @import("fuzzy.zig");
 const link_validator = @import("link_validator.zig");
 const file_watcher = @import("file_watcher.zig");
 const frontmatter = @import("../markdown/frontmatter.zig");
+const tag_parser = @import("../markdown/tag_parser.zig");
+const parser = @import("../markdown/parser.zig");
 const allocator = @import("../utils/allocator.zig").allocator;
 
 pub const LspServer = struct {
@@ -68,6 +70,8 @@ pub const LspServer = struct {
             try self.handleCompletion(writer, request);
         } else if (std.mem.eql(u8, request.method, "textDocument/hover")) {
             try self.handleHover(writer, request);
+        } else if (std.mem.eql(u8, request.method, "textDocument/references")) {
+            try self.handleReferences(writer, request);
         } else {
             try protocol.writeError(writer, request.id, -32601, "Method not found");
         }
@@ -563,6 +567,135 @@ pub const LspServer = struct {
         } else {
             try protocol.writeError(writer, request.id, -32602, "Invalid params");
         }
+    }
+
+    fn handleReferences(self: *LspServer, writer: anytype, request: types.JsonRpcRequest) !void {
+        if (request.params) |params| {
+            if (parseReferencesParams(params)) |ref_params| {
+                if (self.document_manager.getDocument(ref_params.text_document.uri)) |document| {
+                    var locations = std.ArrayList(types.Location).init(allocator);
+                    defer locations.deinit();
+
+                    var uris_to_free = std.ArrayList([]const u8).init(allocator);
+                    defer {
+                        for (uris_to_free.items) |uri| {
+                            allocator.free(uri);
+                        }
+                        uris_to_free.deinit();
+                    }
+
+                    // Check if cursor is on a tag
+                    if ((try self.getTagAtPosition(document.content, ref_params.position))) |tag_name| {
+                        defer allocator.free(tag_name);
+
+                        // Iterate through all markdown files to find tag references
+                        for (self.markdown_files.items) |md_file| {
+                            const file_content = std.fs.cwd().readFileAlloc(allocator, md_file.path, 1024 * 1024) catch |err| {
+                                std.log.warn("Failed to read file for references: {s} - {}", .{ md_file.path, err });
+                                continue;
+                            };
+                            defer allocator.free(file_content);
+
+                            const tags = tag_parser.parseTags(file_content) catch |err| {
+                                std.log.warn("Failed to parse tags for references: {s} - {}", .{ md_file.path, err });
+                                continue;
+                            };
+                            defer {
+                                for (tags) |*tag| tag.deinit();
+                                allocator.free(tags);
+                            }
+
+                            for (tags) |tag| {
+                                if (std.mem.eql(u8, tag.name, tag_name)) {
+                                    const absolute_path = try std.fs.cwd().realpathAlloc(allocator, md_file.path);
+                                    defer allocator.free(absolute_path);
+
+                                    const file_uri = try document_manager.pathToUri(absolute_path);
+                                    try uris_to_free.append(file_uri);
+
+                                    const location = types.Location{
+                                        .uri = file_uri,
+                                        .range = tag.range,
+                                    };
+                                    try locations.append(location);
+                                }
+                            }
+                        }
+                    } else if (self.document_manager.getWikilinkAtPosition(ref_params.text_document.uri, ref_params.position)) |wikilink| {
+                        // Iterate through all markdown files to find wikilink references
+                        for (self.markdown_files.items) |md_file| {
+                            const file_content = std.fs.cwd().readFileAlloc(allocator, md_file.path, 1024 * 1024) catch |err| {
+                                std.log.warn("Failed to read file for references: {s} - {}", .{ md_file.path, err });
+                                continue;
+                            };
+                            defer allocator.free(file_content);
+
+                            const wikilinks = parser.parseWikilinks(file_content) catch |err| {
+                                std.log.warn("Failed to parse wikilinks for references: {s} - {}", .{ md_file.path, err });
+                                continue;
+                            };
+                            defer {
+                                for (wikilinks.items) |*link| link.deinit();
+                                wikilinks.deinit();
+                            }
+
+                            for (wikilinks.items) |link| {
+                                if (std.mem.eql(u8, link.target, wikilink.target)) {
+                                    const absolute_path = try std.fs.cwd().realpathAlloc(allocator, md_file.path);
+                                    defer allocator.free(absolute_path);
+
+                                    const file_uri = try document_manager.pathToUri(absolute_path);
+                                    try uris_to_free.append(file_uri);
+
+                                    const location = types.Location{
+                                        .uri = file_uri,
+                                        .range = link.range,
+                                    };
+                                    try locations.append(location);
+                                }
+                            }
+                        }
+                    }
+
+                    try protocol.writeResponse(writer, request.id, locations.items);
+                    return;
+                }
+
+                // No references found or not on a tag/wikilink
+                try protocol.writeResponse(writer, request.id, null);
+            } else |err| {
+                std.log.warn("Failed to parse references params: {}", .{err});
+                try protocol.writeError(writer, request.id, -32602, "Invalid params");
+            }
+        } else {
+            try protocol.writeError(writer, request.id, -32602, "Invalid params");
+        }
+    }
+
+    fn getTagAtPosition(self: *LspServer, content: []const u8, position: types.Position) !?[]const u8 {
+        _ = self;
+        const tags_info = frontmatter.getTagsLineInfo(content, position) orelse return null;
+
+        const line_content = tags_info.line_content;
+        const tags_start = tags_info.tags_start;
+        const char_offset = position.character;
+
+        if (char_offset < tags_start) return null;
+
+        var current_pos: u32 = tags_start;
+        var it = std.mem.splitScalar(u8, line_content[tags_start..], ',');
+        while (it.next()) |tag_part| {
+            const trimmed_tag = std.mem.trim(u8, tag_part, " []");
+            const tag_start_pos = current_pos + @as(u32, @intCast(std.mem.indexOf(u8, line_content[current_pos..], trimmed_tag) orelse 0));
+            const tag_end_pos = tag_start_pos + @as(u32, @intCast(trimmed_tag.len));
+
+            if (char_offset >= tag_start_pos and char_offset <= tag_end_pos) {
+                return try allocator.dupe(u8, trimmed_tag);
+            }
+            current_pos = tag_end_pos;
+        }
+
+        return null;
     }
 
     fn generateFilePreview(self: *LspServer, file_path: []const u8) ![]const u8 {
@@ -1099,6 +1232,53 @@ fn parseHoverParams(params: std.json.Value) !types.HoverParams {
         .position = types.Position{
             .line = line,
             .character = character,
+        },
+    };
+}
+
+fn parseReferencesParams(params: std.json.Value) !types.ReferenceParams {
+    const obj = switch (params) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const text_document_value = obj.get("textDocument") orelse return error.InvalidParams;
+    const text_document_obj = switch (text_document_value) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const uri = switch (text_document_obj.get("uri") orelse return error.InvalidParams) {
+        .string => |s| s,
+        else => return error.InvalidParams,
+    };
+
+    const position_value = obj.get("position") orelse return error.InvalidParams;
+    const position_obj = switch (position_value) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const line = switch (position_obj.get("line") orelse return error.InvalidParams) {
+        .integer => |i| @as(u32, @intCast(i)),
+        else => return error.InvalidParams,
+    };
+
+    const character = switch (position_obj.get("character") orelse return error.InvalidParams) {
+        .integer => |i| @as(u32, @intCast(i)),
+        else => return error.InvalidParams,
+    };
+
+    return types.ReferenceParams{
+        .text_document = types.TextDocumentIdentifier{
+            .uri = uri,
+        },
+        .position = types.Position{
+            .line = line,
+            .character = character,
+        },
+        .context = .{ // Dummy context, not used yet
+            .includeDeclaration = false,
         },
     };
 }
