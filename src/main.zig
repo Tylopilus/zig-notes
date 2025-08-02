@@ -6,13 +6,6 @@ const allocator_utils = @import("utils/allocator.zig");
 pub fn main() !void {
     defer allocator_utils.deinit();
 
-    // Set up logging
-    var log_file = std.fs.cwd().createFile("lsp.log", .{}) catch |err| switch (err) {
-        error.AccessDenied => return,
-        else => return err,
-    };
-    defer log_file.close();
-
     // Initialize server
     var server = LspServer.init();
     defer server.deinit();
@@ -20,7 +13,6 @@ pub fn main() !void {
     const stdin = std.io.getStdIn().reader();
     const stdout = std.io.getStdOut().writer();
 
-    std.log.info("LSP server starting...", .{});
 
     // Main server loop
     while (true) {
@@ -29,6 +21,11 @@ pub fn main() !void {
                 server.handleMessage(stdout, message) catch |err| {
                     std.log.err("Error handling message: {}", .{err});
                     continue;
+                };
+                
+                // Check for file system changes after handling messages
+                server.checkFileSystemChanges(stdout) catch |err| {
+                    std.log.warn("Error checking file system changes: {}", .{err});
                 };
             } else {
                 // EOF reached, exit gracefully
@@ -40,7 +37,6 @@ pub fn main() !void {
         }
     }
 
-    std.log.info("LSP server shutting down...", .{});
 }
 
 test "basic server functionality" {

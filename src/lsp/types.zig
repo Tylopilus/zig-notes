@@ -52,6 +52,11 @@ pub const DidChangeTextDocumentParams = struct {
     content_changes: []TextDocumentContentChangeEvent,
 };
 
+pub const DidSaveTextDocumentParams = struct {
+    textDocument: TextDocumentIdentifier,
+    text: ?[]const u8 = null,
+};
+
 pub const InitializeParams = struct {
     process_id: ?i32 = null,
     root_path: ?[]const u8 = null,
@@ -226,4 +231,32 @@ pub const MarkupContent = struct {
 pub const Hover = struct {
     contents: MarkupContent,
     range: ?Range = null,
+};
+
+pub const DiagnosticSeverity = enum(u8) {
+    Error = 1,
+    Warning = 2,
+    Information = 3,
+    Hint = 4,
+};
+
+pub const Diagnostic = struct {
+    range: Range,
+    severity: ?DiagnosticSeverity = null,
+    code: ?JsonValue = null,
+    source: ?[]const u8 = null,
+    message: []const u8,
+    tags: ?[]u8 = null,
+    related_information: ?[]DiagnosticRelatedInformation = null,
+};
+
+pub const DiagnosticRelatedInformation = struct {
+    location: Location,
+    message: []const u8,
+};
+
+pub const PublishDiagnosticsParams = struct {
+    uri: []const u8,
+    version: ?i32 = null,
+    diagnostics: []Diagnostic,
 };

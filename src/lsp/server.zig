@@ -5,6 +5,8 @@ const discovery = @import("../markdown/discovery.zig");
 const file_index = @import("file_index.zig");
 const document_manager = @import("document_manager.zig");
 const fuzzy = @import("fuzzy.zig");
+const link_validator = @import("link_validator.zig");
+const file_watcher = @import("file_watcher.zig");
 const allocator = @import("../utils/allocator.zig").allocator;
 
 pub const LspServer = struct {
@@ -14,13 +16,19 @@ pub const LspServer = struct {
     markdown_files: std.ArrayList(discovery.MarkdownFile),
     file_index: file_index.FileIndex,
     document_manager: document_manager.DocumentManager,
+    link_validator: link_validator.LinkValidator,
+    file_watcher: ?file_watcher.FileWatcher,
 
     pub fn init() LspServer {
-        return LspServer{
+        var server = LspServer{
             .markdown_files = std.ArrayList(discovery.MarkdownFile).init(allocator),
             .file_index = file_index.FileIndex.init(),
             .document_manager = document_manager.DocumentManager.init(),
+            .link_validator = undefined,
+            .file_watcher = null,
         };
+        server.link_validator = link_validator.LinkValidator.init();
+        return server;
     }
 
     pub fn deinit(self: *LspServer) void {
@@ -71,6 +79,8 @@ pub const LspServer = struct {
             try self.handleDidClose(writer, notification);
         } else if (std.mem.eql(u8, notification.method, "textDocument/didChange")) {
             try self.handleDidChange(writer, notification);
+        } else if (std.mem.eql(u8, notification.method, "textDocument/didSave")) {
+            try self.handleDidSave(writer, notification);
         }
         // Ignore unknown notifications
     }
@@ -101,7 +111,7 @@ pub const LspServer = struct {
                 .change = 1, // Full sync
                 .willSave = false,
                 .willSaveWaitUntil = false,
-                .save = types.SaveOptions{ .includeText = false },
+                .save = types.SaveOptions{ .includeText = true },
             },
             .hoverProvider = true,
             .completionProvider = types.CompletionOptions{
@@ -124,16 +134,18 @@ pub const LspServer = struct {
             .server_info = server_info,
         };
 
-        std.log.debug("Sending initialize response with capabilities", .{});
         try protocol.writeResponse(writer, request.id, result);
-        std.log.debug("Initialize response sent successfully", .{});
     }
 
     fn handleInitialized(self: *LspServer, writer: anytype, notification: types.JsonRpcNotification) !void {
         _ = writer;
         _ = notification;
         self.initialized = true;
-        std.log.info("LSP server initialized with {} markdown files", .{self.markdown_files.items.len});
+        
+        // Initialize file watcher if we have a workspace
+        if (self.workspace_path) |workspace| {
+            self.file_watcher = file_watcher.FileWatcher.init(workspace);
+        }
     }
 
     fn handleShutdown(self: *LspServer, writer: anytype, request: types.JsonRpcRequest) !void {
@@ -142,7 +154,6 @@ pub const LspServer = struct {
     }
 
     fn handleDidOpen(self: *LspServer, writer: anytype, notification: types.JsonRpcNotification) !void {
-        _ = writer;
         if (notification.params) |params| {
             if (parseDidOpenParams(params)) |did_open_params| {
                 try self.document_manager.didOpen(
@@ -150,7 +161,9 @@ pub const LspServer = struct {
                     did_open_params.text_document.text,
                     did_open_params.text_document.version,
                 );
-                std.log.debug("Opened document: {s}", .{did_open_params.text_document.uri});
+                
+                // Validate links and publish diagnostics
+                try self.validateAndPublishDiagnostics(writer, did_open_params.text_document.uri);
             } else |err| {
                 std.log.warn("Failed to parse didOpen params: {}", .{err});
             }
@@ -162,7 +175,6 @@ pub const LspServer = struct {
         if (notification.params) |params| {
             if (parseDidCloseParams(params)) |did_close_params| {
                 self.document_manager.didClose(did_close_params.text_document.uri);
-                std.log.debug("Closed document: {s}", .{did_close_params.text_document.uri});
             } else |err| {
                 std.log.warn("Failed to parse didClose params: {}", .{err});
             }
@@ -170,7 +182,6 @@ pub const LspServer = struct {
     }
 
     fn handleDidChange(self: *LspServer, writer: anytype, notification: types.JsonRpcNotification) !void {
-        _ = writer;
         if (notification.params) |params| {
             if (parseDidChangeParams(params)) |did_change_params| {
                 // For full sync, we expect one change event with the full text
@@ -181,10 +192,23 @@ pub const LspServer = struct {
                         change.text,
                         did_change_params.text_document.version orelse 0,
                     );
-                    std.log.debug("Changed document: {s}", .{did_change_params.text_document.uri});
+                    
+                    // Validate links and publish diagnostics
+                    try self.validateAndPublishDiagnostics(writer, did_change_params.text_document.uri);
                 }
             } else |err| {
                 std.log.warn("Failed to parse didChange params: {}", .{err});
+            }
+        }
+    }
+
+    fn handleDidSave(self: *LspServer, writer: anytype, notification: types.JsonRpcNotification) !void {
+        if (notification.params) |params| {
+            if (parseDidSaveParams(params)) |did_save_params| {
+                // Validate links and publish diagnostics on save
+                try self.validateAndPublishDiagnostics(writer, did_save_params.textDocument.uri);
+            } else |err| {
+                std.log.warn("Failed to parse didSave params: {}", .{err});
             }
         }
     }
@@ -612,6 +636,56 @@ pub const LspServer = struct {
             .end = types.Position{ .line = query_end_line, .character = query_end_char },
         };
     }
+
+    fn clearDiagnostics(self: *LspServer, writer: anytype, uri: []const u8) !void {
+        _ = self;
+        const uri_copy = try allocator.dupe(u8, uri);
+        defer allocator.free(uri_copy);
+        
+        const empty_diagnostics: []types.Diagnostic = &[_]types.Diagnostic{};
+        const params = types.PublishDiagnosticsParams{
+            .uri = uri_copy,
+            .version = null,
+            .diagnostics = empty_diagnostics,
+        };
+        
+        try protocol.writeNotification(writer, "textDocument/publishDiagnostics", params);
+    }
+
+    fn validateAndPublishDiagnostics(self: *LspServer, writer: anytype, uri: []const u8) !void {
+        if (self.document_manager.getDocument(uri)) |document| {
+            // First clear existing diagnostics
+            try self.clearDiagnostics(writer, uri);
+            
+            const diagnostics = try self.link_validator.validateDocument(&self.file_index, uri, document.wikilinks.items);
+            defer self.link_validator.freeDiagnostics(diagnostics);
+
+            // Create params with proper URI (ensure it's a copy for safety)
+            const uri_copy = try allocator.dupe(u8, uri);
+            defer allocator.free(uri_copy);
+            
+            const params = types.PublishDiagnosticsParams{
+                .uri = uri_copy,
+                .version = document.version,
+                .diagnostics = diagnostics,
+            };
+
+            try protocol.writeNotification(writer, "textDocument/publishDiagnostics", params);
+        }
+    }
+
+    pub fn checkFileSystemChanges(self: *LspServer, writer: anytype) !void {
+        if (self.file_watcher) |*watcher| {
+            if (try watcher.checkForChanges(&self.file_index)) {
+                // Revalidate all open documents
+                var iterator = self.document_manager.open_documents.iterator();
+                while (iterator.next()) |entry| {
+                    const uri = entry.key_ptr.*;
+                    try self.validateAndPublishDiagnostics(writer, uri);
+                }
+            }
+        }
+    }
 };
 
 fn parseDidOpenParams(params: std.json.Value) !types.DidOpenTextDocumentParams {
@@ -864,5 +938,30 @@ fn parseHoverParams(params: std.json.Value) !types.HoverParams {
             .line = line,
             .character = character,
         },
+    };
+}
+
+fn parseDidSaveParams(params: std.json.Value) !types.DidSaveTextDocumentParams {
+    const obj = switch (params) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const text_document_value = obj.get("textDocument") orelse return error.InvalidParams;
+    const text_document_obj = switch (text_document_value) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const uri = switch (text_document_obj.get("uri") orelse return error.InvalidParams) {
+        .string => |s| s,
+        else => return error.InvalidParams,
+    };
+
+    return types.DidSaveTextDocumentParams{
+        .textDocument = types.TextDocumentIdentifier{
+            .uri = uri,
+        },
+        .text = null, // We don't expect text in the save params for our use case
     };
 }

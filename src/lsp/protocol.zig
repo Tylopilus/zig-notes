@@ -54,7 +54,6 @@ pub fn readMessage(reader: anytype) !?Message {
     const bytes_read = try reader.readAll(content);
     if (bytes_read != len) return ProtocolError.InvalidMessage;
 
-    std.log.debug("Received JSON: {s}", .{content});
 
     // Parse JSON and keep it alive globally
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch |err| {
