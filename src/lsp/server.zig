@@ -3,10 +3,12 @@ const types = @import("types.zig");
 const protocol = @import("protocol.zig");
 const discovery = @import("../markdown/discovery.zig");
 const file_index = @import("file_index.zig");
+const tag_index = @import("tag_index.zig");
 const document_manager = @import("document_manager.zig");
 const fuzzy = @import("fuzzy.zig");
 const link_validator = @import("link_validator.zig");
 const file_watcher = @import("file_watcher.zig");
+const frontmatter = @import("../markdown/frontmatter.zig");
 const allocator = @import("../utils/allocator.zig").allocator;
 
 pub const LspServer = struct {
@@ -15,6 +17,7 @@ pub const LspServer = struct {
     workspace_path: ?[]const u8 = null,
     markdown_files: std.ArrayList(discovery.MarkdownFile),
     file_index: file_index.FileIndex,
+    tag_index: tag_index.TagIndex,
     document_manager: document_manager.DocumentManager,
     link_validator: link_validator.LinkValidator,
     file_watcher: ?file_watcher.FileWatcher,
@@ -23,6 +26,7 @@ pub const LspServer = struct {
         var server = LspServer{
             .markdown_files = std.ArrayList(discovery.MarkdownFile).init(allocator),
             .file_index = file_index.FileIndex.init(),
+            .tag_index = tag_index.TagIndex.init(),
             .document_manager = document_manager.DocumentManager.init(),
             .link_validator = undefined,
             .file_watcher = null,
@@ -37,6 +41,7 @@ pub const LspServer = struct {
         }
         self.markdown_files.deinit();
         self.file_index.deinit();
+        self.tag_index.deinit();
         self.document_manager.deinit();
 
         if (self.workspace_path) |path| {
@@ -96,15 +101,26 @@ pub const LspServer = struct {
                 break :blk std.ArrayList(discovery.MarkdownFile).init(allocator);
             };
 
-            // Build file index
+            // Build file index and tag index
             for (self.markdown_files.items) |markdown_file| {
                 self.file_index.addFile(markdown_file.path) catch |err| {
                     std.log.warn("Failed to add file to index: {} - {s}", .{ err, markdown_file.path });
                 };
+
+                // Read file content and build tag index
+                const file_content = std.fs.cwd().readFileAlloc(allocator, markdown_file.path, 1024 * 1024) catch |err| {
+                    std.log.warn("Failed to read file for tag indexing: {} - {s}", .{ err, markdown_file.path });
+                    continue;
+                };
+                defer allocator.free(file_content);
+
+                self.tag_index.addTagsFromFile(markdown_file.path, file_content) catch |err| {
+                    std.log.warn("Failed to add tags from file: {} - {s}", .{ err, markdown_file.path });
+                };
             }
         }
 
-        const trigger_chars = [_][]const u8{ "[", "#" };
+        const trigger_chars = [_][]const u8{ "[", "," };
         const server_capabilities = types.ServerCapabilities{
             .textDocumentSync = types.TextDocumentSyncOptions{
                 .openClose = true,
@@ -193,6 +209,17 @@ pub const LspServer = struct {
                         did_change_params.text_document.version orelse 0,
                     );
                     
+                    // Update tag index with new content
+                    const file_path = document_manager.uriToPath(did_change_params.text_document.uri) catch |err| {
+                        std.log.warn("Failed to convert URI to path for tag indexing: {}", .{err});
+                        return;
+                    };
+                    defer allocator.free(file_path);
+                    
+                    self.tag_index.addTagsFromFile(file_path, change.text) catch |err| {
+                        std.log.warn("Failed to update tag index: {}", .{err});
+                    };
+                    
                     // Validate links and publish diagnostics
                     try self.validateAndPublishDiagnostics(writer, did_change_params.text_document.uri);
                 }
@@ -254,93 +281,222 @@ pub const LspServer = struct {
         }
     }
 
+    const CompletionContext = enum {
+        wikilink,  // Inside [[...]]
+        tag,       // In frontmatter tags array
+        none,      // No special context
+    };
+
+    fn detectCompletionContext(self: *LspServer, content: []const u8, position: types.Position) CompletionContext {
+        // Check for wikilink context first
+        if (self.isWikilinkContext(content, position)) {
+            return .wikilink;
+        }
+        
+        // Check for frontmatter tags context
+        if (frontmatter.getTagsLineInfo(content, position)) |_| {
+            return .tag;
+        }
+        
+        return .none;
+    }
+
+    fn completeFilenames(self: *LspServer, completion_params: types.CompletionParams, document: *document_manager.Document) !types.CompletionList {
+        // Extract query from the wikilink
+        const query = self.extractWikilinkQuery(document.content, completion_params.position) catch "";
+        defer if (query.len > 0) allocator.free(query);
+        
+        // Collect all candidate filenames
+        var candidates = std.ArrayList([]const u8).init(allocator);
+        defer {
+            for (candidates.items) |candidate| {
+                allocator.free(candidate);
+            }
+            candidates.deinit();
+        }
+        
+        for (self.file_index.all_files.items) |file_metadata| {
+            // Convert file path to URI for comparison
+            const file_uri = document_manager.pathToUri(file_metadata.path) catch continue;
+            defer allocator.free(file_uri);
+            
+            // Skip the current file
+            if (std.mem.eql(u8, file_uri, completion_params.textDocument.uri)) continue;
+
+            // Get the filename with extension
+            const filename = std.fs.path.basename(file_metadata.path);
+            try candidates.append(try allocator.dupe(u8, filename));
+        }
+        
+        // Use fuzzy matching to filter and sort candidates
+        const fuzzy_matches = try fuzzy.fuzzyMatch(query, candidates.items, 20);
+        defer fuzzy.freeFuzzyMatches(fuzzy_matches);
+        
+        // Generate completion items from fuzzy matches
+        var completion_items = std.ArrayList(types.CompletionItem).init(allocator);
+        defer completion_items.deinit();
+
+        for (fuzzy_matches) |match| {
+            // Find the original file metadata for details
+            var detail_path: ?[]const u8 = null;
+            for (self.file_index.all_files.items) |file_metadata| {
+                const filename = std.fs.path.basename(file_metadata.path);
+                if (std.mem.eql(u8, filename, match.text)) {
+                    detail_path = file_metadata.path;
+                    break;
+                }
+            }
+            
+            // Create text edit that replaces from after [[ to cursor position
+            const query_range = try self.getWikilinkQueryRange(document.content, completion_params.position);
+            const new_text = try std.fmt.allocPrint(allocator, "{s}]]", .{match.text});
+            
+            const text_edit = types.TextEdit{
+                .range = query_range,
+                .newText = new_text,
+            };
+
+            const item = types.CompletionItem{
+                .label = try allocator.dupe(u8, match.text),
+                .kind = 17, // File completion kind
+                .detail = if (detail_path) |path| try allocator.dupe(u8, path) else null,
+                .textEdit = text_edit,
+                .filterText = try allocator.dupe(u8, match.text),
+            };
+            try completion_items.append(item);
+        }
+
+        return types.CompletionList{
+            .isIncomplete = false,
+            .items = try allocator.dupe(types.CompletionItem, completion_items.items),
+        };
+    }
+
+    fn completeTags(self: *LspServer, completion_params: types.CompletionParams, document: *document_manager.Document) !types.CompletionList {
+        // Extract tag prefix
+        const prefix = self.extractTagPrefix(document.content, completion_params.position) catch "";
+        defer if (prefix.len > 0) allocator.free(prefix);
+        
+        // Get all tags for fuzzy matching
+        const all_tags = try self.tag_index.getAllTags();
+        defer {
+            for (all_tags) |tag| {
+                allocator.free(tag);
+            }
+            allocator.free(all_tags);
+        }
+        
+        // Use fuzzy matching to filter and sort tags
+        const fuzzy_matches = try fuzzy.fuzzyMatch(prefix, all_tags, 20);
+        defer fuzzy.freeFuzzyMatches(fuzzy_matches);
+        
+        // Generate completion items
+        var completion_items = std.ArrayList(types.CompletionItem).init(allocator);
+        defer completion_items.deinit();
+
+        for (fuzzy_matches) |match| {
+            const file_count = self.tag_index.getTagCount(match.text);
+            const detail = try std.fmt.allocPrint(allocator, "Used in {} files", .{file_count});
+            
+            const item = types.CompletionItem{
+                .label = try allocator.dupe(u8, match.text),
+                .kind = 14, // Keyword completion kind
+                .detail = detail,
+                .insertText = try allocator.dupe(u8, match.text),
+                .filterText = try allocator.dupe(u8, match.text),
+            };
+            try completion_items.append(item);
+        }
+
+        return types.CompletionList{
+            .isIncomplete = false,
+            .items = try allocator.dupe(types.CompletionItem, completion_items.items),
+        };
+    }
+
+    fn extractTagPrefix(self: *LspServer, content: []const u8, position: types.Position) ![]const u8 {
+        _ = self;
+        
+        // Get tags line information
+        const tags_info = frontmatter.getTagsLineInfo(content, position) orelse {
+            return try allocator.dupe(u8, "");
+        };
+        
+        // Find current position within the tags array
+        const line_content = tags_info.line_content;
+        const tags_start = tags_info.tags_start;
+        
+        // Convert position to offset within the line
+        const char_offset = position.character;
+        
+        if (char_offset < tags_start) {
+            return try allocator.dupe(u8, "");
+        }
+        
+        // Find the start of the current tag being typed
+        var tag_start = tags_start;
+        var i = tags_start;
+        
+        while (i < char_offset and i < line_content.len) {
+            const c = line_content[i];
+            if (c == ',' or c == ']') {
+                // Move past comma and whitespace to start of next tag
+                tag_start = i + 1;
+                while (tag_start < char_offset and tag_start < line_content.len and 
+                       std.ascii.isWhitespace(line_content[tag_start])) {
+                    tag_start += 1;
+                }
+            }
+            i += 1;
+        }
+        
+        // Extract prefix from tag start to cursor position
+        if (char_offset <= tag_start) {
+            return try allocator.dupe(u8, "");
+        }
+        
+        const prefix = line_content[tag_start..char_offset];
+        return try allocator.dupe(u8, std.mem.trim(u8, prefix, " \t"));
+    }
+
     fn handleCompletion(self: *LspServer, writer: anytype, request: types.JsonRpcRequest) !void {
         if (request.params) |params| {
             if (parseCompletionParams(params)) |completion_params| {
-                // Check if we're in a wikilink context
                 if (self.document_manager.getDocument(completion_params.textDocument.uri)) |document| {
-                    if (self.isWikilinkContext(document.content, completion_params.position)) {
-                        // Extract query from the wikilink
-                        const query = self.extractWikilinkQuery(document.content, completion_params.position) catch "";
-                        defer if (query.len > 0) allocator.free(query);
-                        
-                        // Collect all candidate filenames
-                        var candidates = std.ArrayList([]const u8).init(allocator);
-                        defer {
-                            for (candidates.items) |candidate| {
-                                allocator.free(candidate);
-                            }
-                            candidates.deinit();
-                        }
-                        
-                        for (self.file_index.all_files.items) |file_metadata| {
-                            // Convert file path to URI for comparison
-                            const file_uri = document_manager.pathToUri(file_metadata.path) catch continue;
-                            defer allocator.free(file_uri);
-                            
-                            // Skip the current file
-                            if (std.mem.eql(u8, file_uri, completion_params.textDocument.uri)) continue;
-
-                            // Get the filename with extension
-                            const filename = std.fs.path.basename(file_metadata.path);
-                            try candidates.append(try allocator.dupe(u8, filename));
-                        }
-                        
-                        // Use fuzzy matching to filter and sort candidates
-                        const fuzzy_matches = try fuzzy.fuzzyMatch(query, candidates.items, 20);
-                        defer fuzzy.freeFuzzyMatches(fuzzy_matches);
-                        
-                        // Generate completion items from fuzzy matches
-                        var completion_items = std.ArrayList(types.CompletionItem).init(allocator);
-                        defer {
-                            for (completion_items.items) |*item| {
-                                allocator.free(item.label);
-                                if (item.insertText) |text| allocator.free(text);
-                                if (item.detail) |detail| allocator.free(detail);
-                                if (item.textEdit) |textEdit| allocator.free(textEdit.newText);
-                                if (item.filterText) |filter| allocator.free(filter);
-                            }
-                            completion_items.deinit();
-                        }
-
-                        for (fuzzy_matches) |match| {
-                            // Find the original file metadata for details
-                            var detail_path: ?[]const u8 = null;
-                            for (self.file_index.all_files.items) |file_metadata| {
-                                const filename = std.fs.path.basename(file_metadata.path);
-                                if (std.mem.eql(u8, filename, match.text)) {
-                                    detail_path = file_metadata.path;
-                                    break;
+                    // Detect completion context
+                    const context = self.detectCompletionContext(document.content, completion_params.position);
+                    
+                    switch (context) {
+                        .wikilink => {
+                            const completion_list = try self.completeFilenames(completion_params, document);
+                            defer {
+                                for (completion_list.items) |*item| {
+                                    allocator.free(item.label);
+                                    if (item.insertText) |text| allocator.free(text);
+                                    if (item.detail) |detail| allocator.free(detail);
+                                    if (item.textEdit) |textEdit| allocator.free(textEdit.newText);
+                                    if (item.filterText) |filter| allocator.free(filter);
                                 }
+                                allocator.free(completion_list.items);
                             }
-                            
-                            // Create text edit that replaces from after [[ to cursor position
-                            const query_range = try self.getWikilinkQueryRange(document.content, completion_params.position);
-                            const new_text = try std.fmt.allocPrint(allocator, "{s}]]", .{match.text});
-                            
-                            const text_edit = types.TextEdit{
-                                .range = query_range,
-                                .newText = new_text,
-                            };
-
-                            const item = types.CompletionItem{
-                                .label = try allocator.dupe(u8, match.text),
-                                .kind = 17, // File completion kind
-                                .detail = if (detail_path) |path| try allocator.dupe(u8, path) else null,
-                                .textEdit = text_edit,
-                                .filterText = try allocator.dupe(u8, match.text),
-                            };
-                            try completion_items.append(item);
-                        }
-
-                        const completion_list = types.CompletionList{
-                            .isIncomplete = false,
-                            .items = try allocator.dupe(types.CompletionItem, completion_items.items),
-                        };
-                        defer allocator.free(completion_list.items);
-
-                        try protocol.writeResponse(writer, request.id, completion_list);
-                        return;
+                            try protocol.writeResponse(writer, request.id, completion_list);
+                            return;
+                        },
+                        .tag => {
+                            const completion_list = try self.completeTags(completion_params, document);
+                            defer {
+                                for (completion_list.items) |*item| {
+                                    allocator.free(item.label);
+                                    if (item.insertText) |text| allocator.free(text);
+                                    if (item.detail) |detail| allocator.free(detail);
+                                    if (item.filterText) |filter| allocator.free(filter);
+                                }
+                                allocator.free(completion_list.items);
+                            }
+                            try protocol.writeResponse(writer, request.id, completion_list);
+                            return;
+                        },
+                        .none => {},
                     }
                 }
 
