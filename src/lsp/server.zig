@@ -53,6 +53,8 @@ pub const LspServer = struct {
             try self.handleDefinition(writer, request);
         } else if (std.mem.eql(u8, request.method, "textDocument/completion")) {
             try self.handleCompletion(writer, request);
+        } else if (std.mem.eql(u8, request.method, "textDocument/hover")) {
+            try self.handleHover(writer, request);
         } else {
             try protocol.writeError(writer, request.id, -32601, "Method not found");
         }
@@ -331,6 +333,101 @@ pub const LspServer = struct {
         } else {
             try protocol.writeError(writer, request.id, -32602, "Invalid params");
         }
+    }
+
+    fn handleHover(self: *LspServer, writer: anytype, request: types.JsonRpcRequest) !void {
+        if (request.params) |params| {
+            if (parseHoverParams(params)) |hover_params| {
+                // Check if cursor is on a wikilink
+                if (self.document_manager.getDocument(hover_params.textDocument.uri)) |_| {
+                    if (self.document_manager.getWikilinkAtPosition(hover_params.textDocument.uri, hover_params.position)) |wikilink| {
+                        // Resolve wikilink to file path
+                        if (self.file_index.resolveWikilink(wikilink.target)) |target_path| {
+                            // Convert relative path to absolute path
+                            const absolute_path = if (std.fs.path.isAbsolute(target_path))
+                                try allocator.dupe(u8, target_path)
+                            else
+                                try std.fs.cwd().realpathAlloc(allocator, target_path);
+                            defer allocator.free(absolute_path);
+
+                            // Generate file preview
+                            const preview_content = try self.generateFilePreview(absolute_path);
+                            defer allocator.free(preview_content);
+
+                            const hover_response = types.Hover{
+                                .contents = types.MarkupContent{
+                                    .kind = "markdown",
+                                    .value = preview_content,
+                                },
+                                .range = wikilink.range,
+                            };
+
+                            try protocol.writeResponse(writer, request.id, hover_response);
+                            return;
+                        }
+                    }
+                }
+
+                // No hover information available
+                try protocol.writeResponse(writer, request.id, null);
+            } else |err| {
+                std.log.warn("Failed to parse hover params: {}", .{err});
+                try protocol.writeError(writer, request.id, -32602, "Invalid params");
+            }
+        } else {
+            try protocol.writeError(writer, request.id, -32602, "Invalid params");
+        }
+    }
+
+    fn generateFilePreview(self: *LspServer, file_path: []const u8) ![]const u8 {
+        _ = self;
+        
+        // Try to read the file
+        const file = std.fs.openFileAbsolute(file_path, .{}) catch |err| {
+            return try std.fmt.allocPrint(allocator, "**File not found**: `{s}`\n\nError: {}", .{ file_path, err });
+        };
+        defer file.close();
+
+        const file_size = try file.getEndPos();
+        if (file_size == 0) {
+            return try std.fmt.allocPrint(allocator, "**Empty file**: `{s}`", .{file_path});
+        }
+
+        // Limit preview to first 1KB to avoid huge hover windows
+        const preview_size = @min(file_size, 1024);
+        const content = try allocator.alloc(u8, preview_size);
+        defer allocator.free(content);
+
+        _ = try file.readAll(content);
+
+        // Count lines for preview info
+        var line_count: usize = 1;
+        for (content) |c| {
+            if (c == '\n') line_count += 1;
+        }
+
+        // Create preview with file info and content
+        const filename = std.fs.path.basename(file_path);
+        var preview = std.ArrayList(u8).init(allocator);
+        defer preview.deinit();
+
+        try preview.writer().print("**📄 {s}**", .{filename});
+        
+        if (file_size > preview_size) {
+            try preview.writer().print(" _(showing first {}B of {}B)_", .{ preview_size, file_size });
+        }
+        
+        try preview.writer().print("\n\n---\n\n", .{});
+
+        // Add the actual content
+        try preview.appendSlice(content);
+
+        // If file was truncated, add indicator
+        if (file_size > preview_size) {
+            try preview.writer().print("\n\n---\n\n_...truncated_", .{});
+        }
+
+        return try allocator.dupe(u8, preview.items);
     }
 
     fn isWikilinkContext(self: *LspServer, content: []const u8, position: types.Position) bool {
@@ -716,6 +813,50 @@ fn parseCompletionParams(params: std.json.Value) !types.CompletionParams {
     };
 
     return types.CompletionParams{
+        .textDocument = types.TextDocumentIdentifier{
+            .uri = uri,
+        },
+        .position = types.Position{
+            .line = line,
+            .character = character,
+        },
+    };
+}
+
+fn parseHoverParams(params: std.json.Value) !types.HoverParams {
+    const obj = switch (params) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const text_document_value = obj.get("textDocument") orelse return error.InvalidParams;
+    const text_document_obj = switch (text_document_value) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const uri = switch (text_document_obj.get("uri") orelse return error.InvalidParams) {
+        .string => |s| s,
+        else => return error.InvalidParams,
+    };
+
+    const position_value = obj.get("position") orelse return error.InvalidParams;
+    const position_obj = switch (position_value) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const line = switch (position_obj.get("line") orelse return error.InvalidParams) {
+        .integer => |i| @as(u32, @intCast(i)),
+        else => return error.InvalidParams,
+    };
+
+    const character = switch (position_obj.get("character") orelse return error.InvalidParams) {
+        .integer => |i| @as(u32, @intCast(i)),
+        else => return error.InvalidParams,
+    };
+
+    return types.HoverParams{
         .textDocument = types.TextDocumentIdentifier{
             .uri = uri,
         },

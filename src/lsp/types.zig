@@ -212,3 +212,18 @@ pub const CompletionList = struct {
     isIncomplete: bool = false,
     items: []CompletionItem,
 };
+
+pub const HoverParams = struct {
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+};
+
+pub const MarkupContent = struct {
+    kind: []const u8, // "markdown" or "plaintext"
+    value: []const u8,
+};
+
+pub const Hover = struct {
+    contents: MarkupContent,
+    range: ?Range = null,
+};
