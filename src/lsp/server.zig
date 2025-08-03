@@ -11,6 +11,7 @@ const file_watcher = @import("file_watcher.zig");
 const frontmatter = @import("../markdown/frontmatter.zig");
 const tag_parser = @import("../markdown/tag_parser.zig");
 const parser = @import("../markdown/parser.zig");
+const link_graph = @import("link_graph.zig");
 const allocator = @import("../utils/allocator.zig").allocator;
 
 pub const LspServer = struct {
@@ -23,6 +24,7 @@ pub const LspServer = struct {
     document_manager: document_manager.DocumentManager,
     link_validator: link_validator.LinkValidator,
     file_watcher: ?file_watcher.FileWatcher,
+    link_graph: link_graph.LinkGraph,
 
     pub fn init() LspServer {
         var server = LspServer{
@@ -32,6 +34,7 @@ pub const LspServer = struct {
             .document_manager = document_manager.DocumentManager.init(),
             .link_validator = undefined,
             .file_watcher = null,
+            .link_graph = link_graph.LinkGraph.init(),
         };
         server.link_validator = link_validator.LinkValidator.init();
         return server;
@@ -45,6 +48,7 @@ pub const LspServer = struct {
         self.file_index.deinit();
         self.tag_index.deinit();
         self.document_manager.deinit();
+        self.link_graph.deinit();
 
         if (self.workspace_path) |path| {
             allocator.free(path);
@@ -72,6 +76,8 @@ pub const LspServer = struct {
             try self.handleHover(writer, request);
         } else if (std.mem.eql(u8, request.method, "textDocument/references")) {
             try self.handleReferences(writer, request);
+        } else if (std.mem.eql(u8, request.method, "textDocument/rename")) {
+            try self.handleRename(writer, request);
         } else {
             try protocol.writeError(writer, request.id, -32601, "Method not found");
         }
@@ -121,6 +127,39 @@ pub const LspServer = struct {
                 self.tag_index.addTagsFromFile(markdown_file.path, file_content) catch |err| {
                     std.log.warn("Failed to add tags from file: {} - {s}", .{ err, markdown_file.path });
                 };
+
+                // Parse wikilinks and tags to build link graph
+                const wikilinks = parser.parseWikilinks(file_content) catch |err| {
+                    std.log.warn("Failed to parse wikilinks for link graph: {s} - {}", .{ markdown_file.path, err });
+                    continue;
+                };
+                defer {
+                    for (wikilinks.items) |*link| link.deinit();
+                    wikilinks.deinit();
+                }
+
+                for (wikilinks.items) |link| {
+                    if (self.file_index.resolveWikilink(link.target)) |target_path| {
+                        self.link_graph.addLink(markdown_file.path, target_path) catch |err| {
+                            std.log.warn("Failed to add link to graph: {}", .{err});
+                        };
+                    }
+                }
+
+                const tags = tag_parser.parseTags(file_content) catch |err| {
+                    std.log.warn("Failed to parse tags for link graph: {s} - {}", .{ markdown_file.path, err });
+                    continue;
+                };
+                defer {
+                    for (tags) |*tag| tag.deinit();
+                    allocator.free(tags);
+                }
+
+                for (tags) |tag| {
+                    self.link_graph.addTagUsage(markdown_file.path, tag.name) catch |err| {
+                        std.log.warn("Failed to add tag usage to graph: {}", .{err});
+                    };
+                }
             }
         }
 
@@ -672,6 +711,174 @@ pub const LspServer = struct {
         }
     }
 
+    fn handleRename(self: *LspServer, writer: anytype, request: types.JsonRpcRequest) !void {
+        if (request.params) |params| {
+            if (parseRenameParams(params)) |rename_params| {
+                if (self.document_manager.getDocument(rename_params.text_document.uri)) |document| {
+                    // Check if cursor is on a tag
+                    if ((try self.getTagAtPosition(document.content, rename_params.position))) |tag_name| {
+                        defer allocator.free(tag_name);
+                        
+                        // Find all files that use this tag for cross-file rename
+                        const affected_files = self.link_graph.getFilesReferencingTag(tag_name);
+                        if (affected_files == null or affected_files.?.count() <= 1) {
+                            // If no files found in link graph or only one file, just rename in current file
+                            const workspace_edit = try self.createSingleFileTagRename(rename_params.text_document.uri, document.content, rename_params.position, rename_params.new_name);
+                            try protocol.writeResponse(writer, request.id, workspace_edit);
+                            return;
+                        }
+                        
+                        // Create cross-file rename
+                        const workspace_edit = try self.createCrossFileTagRename(affected_files.?, tag_name, rename_params.new_name);
+                        try protocol.writeResponse(writer, request.id, workspace_edit);
+                        return;
+                    } else if (self.document_manager.getWikilinkAtPosition(rename_params.text_document.uri, rename_params.position)) |wikilink| {
+                        const old_path = try document_manager.uriToPath(rename_params.text_document.uri);
+                        defer allocator.free(old_path);
+
+                        const new_path = try self.buildNewPath(old_path, rename_params.new_name);
+                        defer allocator.free(new_path);
+
+                        const referencing_files = self.link_graph.getFilesReferencingFile(old_path) orelse {
+                            try protocol.writeResponse(writer, request.id, null);
+                            return;
+                        };
+
+                        var changes = std.StringHashMap([]types.TextEdit).init(allocator);
+                        defer changes.deinit();
+
+                        var it = referencing_files.keyIterator();
+                        while (it.next()) |file_path_ptr| {
+                            const file_path = file_path_ptr.*;
+                            const file_content = std.fs.cwd().readFileAlloc(allocator, file_path, 1024 * 1024) catch |err| {
+                                std.log.warn("Failed to read file for rename: {s} - {}", .{ file_path, err });
+                                continue;
+                            };
+                            defer allocator.free(file_content);
+
+                            const wikilinks = parser.parseWikilinks(file_content) catch |err| {
+                                std.log.warn("Failed to parse wikilinks for rename: {s} - {}", .{ file_path, err });
+                                continue;
+                            };
+                            defer {
+                                for (wikilinks.items) |*link| link.deinit();
+                                wikilinks.deinit();
+                            }
+
+                            var edits = std.ArrayList(types.TextEdit).init(allocator);
+
+                            for (wikilinks.items) |link| {
+                                if (std.mem.eql(u8, link.target, wikilink.target)) {
+                                    const edit = types.TextEdit{
+                                        .range = link.range,
+                                        .newText = rename_params.new_name,
+                                    };
+                                    try edits.append(edit);
+                                }
+                            }
+
+                            const file_uri = try document_manager.pathToUri(file_path);
+                            defer allocator.free(file_uri);
+                            try changes.put(file_uri, try edits.toOwnedSlice());
+                        }
+
+                        var json_changes = std.json.ObjectMap.init(allocator);
+                        var changes_it = changes.iterator();
+                        while (changes_it.next()) |entry| {
+                            const uri = entry.key_ptr.*;
+                            const edits_array = entry.value_ptr.*;
+
+                            var json_edits = std.json.Array.init(allocator);
+                            for (edits_array) |edit| {
+                                var edit_obj = std.json.ObjectMap.init(allocator);
+                                defer edit_obj.deinit();
+
+                                var range_obj = std.json.ObjectMap.init(allocator);
+                                defer range_obj.deinit();
+
+                                var start_pos_obj = std.json.ObjectMap.init(allocator);
+                                defer start_pos_obj.deinit();
+                                try start_pos_obj.put("line", .{ .integer = @as(i64, edit.range.start.line) });
+                                try start_pos_obj.put("character", .{ .integer = @as(i64, edit.range.start.character) });
+
+                                var end_pos_obj = std.json.ObjectMap.init(allocator);
+                                defer end_pos_obj.deinit();
+                                try end_pos_obj.put("line", .{ .integer = @as(i64, edit.range.end.line) });
+                                try end_pos_obj.put("character", .{ .integer = @as(i64, edit.range.end.character) });
+
+                                try range_obj.put("start", .{ .object = start_pos_obj });
+                                try range_obj.put("end", .{ .object = end_pos_obj });
+
+                                try edit_obj.put("range", .{ .object = range_obj });
+                                try edit_obj.put("newText", .{ .string = edit.newText });
+
+                                try json_edits.append(.{ .object = edit_obj });
+                            }
+                            try json_changes.put(uri, .{ .array = json_edits });
+                        }
+
+                        var json_document_changes = std.json.Array.init(allocator);
+                        defer json_document_changes.deinit();
+
+                        const old_uri = try document_manager.pathToUri(old_path);
+                        defer allocator.free(old_uri);
+                        const new_uri = try document_manager.pathToUri(new_path);
+                        defer allocator.free(new_uri);
+
+                        var rename_op_obj = std.json.ObjectMap.init(allocator);
+                        defer rename_op_obj.deinit();
+                        try rename_op_obj.put("oldUri", .{ .string = old_uri });
+                        try rename_op_obj.put("newUri", .{ .string = new_uri });
+
+                        var resource_op_obj = std.json.ObjectMap.init(allocator);
+                        defer resource_op_obj.deinit();
+                        try resource_op_obj.put("rename", .{ .object = rename_op_obj });
+
+                        var doc_change_obj = std.json.ObjectMap.init(allocator);
+                        defer doc_change_obj.deinit();
+                        try doc_change_obj.put("resourceOperation", .{ .object = resource_op_obj });
+
+                        try json_document_changes.append(.{ .object = doc_change_obj });
+
+                        const workspace_edit = types.WorkspaceEdit{
+                            .changes = .{ .object = json_changes },
+                            .documentChanges = .{ .array = json_document_changes },
+                        };
+
+                        try protocol.writeResponse(writer, request.id, workspace_edit);
+                        return;
+                    } else { // No tag or wikilink found at position
+                        try protocol.writeResponse(writer, request.id, null);
+                        return;
+                    }
+                } else { // Document not found
+                    try protocol.writeResponse(writer, request.id, null);
+                    return;
+                }
+            } else |err| {
+                std.log.warn("Failed to parse rename params: {}", .{err});
+                try protocol.writeError(writer, request.id, -32602, "Invalid params");
+            }
+        } else {
+            try protocol.writeError(writer, request.id, -32602, "Invalid params");
+        }
+    }
+
+    fn buildNewPath(self: *LspServer, old_path: []const u8, new_name: []const u8) ![]const u8 {
+        _ = self;
+        const dir = std.fs.path.dirname(old_path) orelse ".";
+        const ext = std.fs.path.extension(old_path);
+        
+        // Remove the leading dot from extension if present
+        const clean_ext = if (ext.len > 0 and ext[0] == '.') ext[1..] else ext;
+        
+        if (clean_ext.len > 0) {
+            return try std.fmt.allocPrint(allocator, "{s}/{s}.{s}", .{ dir, new_name, clean_ext });
+        } else {
+            return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, new_name });
+        }
+    }
+
     fn getTagAtPosition(self: *LspServer, content: []const u8, position: types.Position) !?[]const u8 {
         _ = self;
         const tags_info = frontmatter.getTagsLineInfo(content, position) orelse return null;
@@ -686,16 +893,163 @@ pub const LspServer = struct {
         var it = std.mem.splitScalar(u8, line_content[tags_start..], ',');
         while (it.next()) |tag_part| {
             const trimmed_tag = std.mem.trim(u8, tag_part, " []");
-            const tag_start_pos = current_pos + @as(u32, @intCast(std.mem.indexOf(u8, line_content[current_pos..], trimmed_tag) orelse 0));
+            if (trimmed_tag.len == 0) {
+                current_pos += @as(u32, @intCast(tag_part.len + 1)); // +1 for comma
+                continue;
+            }
+            
+            // Find where the trimmed tag starts within the current tag_part
+            const tag_start_in_part = std.mem.indexOf(u8, tag_part, trimmed_tag) orelse 0;
+            const tag_start_pos = current_pos + @as(u32, @intCast(tag_start_in_part));
             const tag_end_pos = tag_start_pos + @as(u32, @intCast(trimmed_tag.len));
 
             if (char_offset >= tag_start_pos and char_offset <= tag_end_pos) {
                 return try allocator.dupe(u8, trimmed_tag);
             }
-            current_pos = tag_end_pos;
+            // Advance past this tag part including any comma
+            current_pos += @as(u32, @intCast(tag_part.len + 1)); // +1 for comma
         }
 
         return null;
+    }
+
+    fn getTagRangeAtPosition(self: *LspServer, content: []const u8, position: types.Position) !types.Range {
+        _ = self;
+        const tags_info = frontmatter.getTagsLineInfo(content, position) orelse {
+            return error.InvalidPosition;
+        };
+
+        const line_content = tags_info.line_content;
+        const tags_start = tags_info.tags_start;
+        const char_offset = position.character;
+
+        if (char_offset < tags_start) return error.InvalidPosition;
+
+        var current_pos: u32 = tags_start;
+        var it = std.mem.splitScalar(u8, line_content[tags_start..], ',');
+        while (it.next()) |tag_part| {
+            const trimmed_tag = std.mem.trim(u8, tag_part, " []");
+            if (trimmed_tag.len == 0) {
+                current_pos += @as(u32, @intCast(tag_part.len + 1)); // +1 for comma
+                continue;
+            }
+            
+            // Find where the trimmed tag starts within the current tag_part
+            const tag_start_in_part = std.mem.indexOf(u8, tag_part, trimmed_tag) orelse 0;
+            const tag_start_pos = current_pos + @as(u32, @intCast(tag_start_in_part));
+            const tag_end_pos = tag_start_pos + @as(u32, @intCast(trimmed_tag.len));
+
+            if (char_offset >= tag_start_pos and char_offset <= tag_end_pos) {
+                return types.Range{
+                    .start = types.Position{ .line = position.line, .character = tag_start_pos },
+                    .end = types.Position{ .line = position.line, .character = tag_end_pos },
+                };
+            }
+            // Advance past this tag part including any comma
+            current_pos += @as(u32, @intCast(tag_part.len + 1)); // +1 for comma
+        }
+
+        return error.TagNotFound;
+    }
+    
+    fn createSingleFileTagRename(self: *LspServer, uri: []const u8, content: []const u8, position: types.Position, new_name: []const u8) !types.WorkspaceEdit {
+        const tag_range = try self.getTagRangeAtPosition(content, position);
+        
+        var changes_obj = std.json.ObjectMap.init(allocator);
+        var edits_array = std.json.Array.init(allocator);
+        
+        var edit_obj = std.json.ObjectMap.init(allocator);
+        var range_obj = std.json.ObjectMap.init(allocator);
+        var start_obj = std.json.ObjectMap.init(allocator);
+        var end_obj = std.json.ObjectMap.init(allocator);
+        
+        try start_obj.put("line", .{ .integer = @as(i64, @intCast(tag_range.start.line)) });
+        try start_obj.put("character", .{ .integer = @as(i64, @intCast(tag_range.start.character)) });
+        try end_obj.put("line", .{ .integer = @as(i64, @intCast(tag_range.end.line)) });
+        try end_obj.put("character", .{ .integer = @as(i64, @intCast(tag_range.end.character)) });
+        
+        try range_obj.put("start", .{ .object = start_obj });
+        try range_obj.put("end", .{ .object = end_obj });
+        try edit_obj.put("range", .{ .object = range_obj });
+        try edit_obj.put("newText", .{ .string = new_name });
+        
+        try edits_array.append(.{ .object = edit_obj });
+        try changes_obj.put(uri, .{ .array = edits_array });
+        
+        return types.WorkspaceEdit{
+            .changes = .{ .object = changes_obj },
+        };
+    }
+    
+    fn createCrossFileTagRename(self: *LspServer, affected_files: *const link_graph.LinkGraph.StringHashSet, tag_name: []const u8, new_name: []const u8) !types.WorkspaceEdit {
+        _ = self;
+        
+        // Just return a simple single-file edit for now to avoid JSON corruption
+        // This should work reliably while we debug the multi-file approach
+        var empty_changes = std.json.ObjectMap.init(allocator);
+        
+        // Process each file and add edits
+        var file_it = affected_files.keyIterator();
+        while (file_it.next()) |file_path_ptr| {
+            const file_path = file_path_ptr.*;
+            
+            // Read the file content
+            const file_content = std.fs.cwd().readFileAlloc(allocator, file_path, 1024 * 1024) catch |err| {
+                std.log.warn("Failed to read file for rename: {s} - {}", .{ file_path, err });
+                continue;
+            };
+            defer allocator.free(file_content);
+            
+            // Parse tags and find all occurrences to rename
+            const tags = tag_parser.parseTags(file_content) catch |err| {
+                std.log.warn("Failed to parse tags for rename: {s} - {}", .{ file_path, err });
+                continue;
+            };
+            defer {
+                for (tags) |*tag| tag.deinit();
+                allocator.free(tags);
+            }
+            
+            // Create edits array for this file
+            var edits_array = std.json.Array.init(allocator);
+            
+            for (tags) |tag| {
+                if (std.mem.eql(u8, tag.name, tag_name)) {
+                    // Create a basic edit object
+                    var edit_obj = std.json.ObjectMap.init(allocator);
+                    
+                    // Create range object
+                    var range_obj = std.json.ObjectMap.init(allocator);
+                    var start_obj = std.json.ObjectMap.init(allocator);
+                    var end_obj = std.json.ObjectMap.init(allocator);
+                    
+                    try start_obj.put("line", .{ .integer = @as(i64, tag.range.start.line) });
+                    try start_obj.put("character", .{ .integer = @as(i64, tag.range.start.character) });
+                    try end_obj.put("line", .{ .integer = @as(i64, tag.range.end.line) });
+                    try end_obj.put("character", .{ .integer = @as(i64, tag.range.end.character) });
+                    
+                    try range_obj.put("start", .{ .object = start_obj });
+                    try range_obj.put("end", .{ .object = end_obj });
+                    
+                    try edit_obj.put("range", .{ .object = range_obj });
+                    try edit_obj.put("newText", .{ .string = new_name });
+                    
+                    try edits_array.append(.{ .object = edit_obj });
+                }
+            }
+            
+            // Only add file if it has edits
+            if (edits_array.items.len > 0) {
+                const file_uri = try document_manager.pathToUri(file_path);
+                try empty_changes.put(file_uri, .{ .array = edits_array });
+            } else {
+                edits_array.deinit();
+            }
+        }
+        
+        return types.WorkspaceEdit{
+            .changes = .{ .object = empty_changes },
+        };
     }
 
     fn generateFilePreview(self: *LspServer, file_path: []const u8) ![]const u8 {
@@ -1280,6 +1634,56 @@ fn parseReferencesParams(params: std.json.Value) !types.ReferenceParams {
         .context = .{ // Dummy context, not used yet
             .includeDeclaration = false,
         },
+    };
+}
+
+fn parseRenameParams(params: std.json.Value) !types.RenameParams {
+    const obj = switch (params) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const text_document_value = obj.get("textDocument") orelse return error.InvalidParams;
+    const text_document_obj = switch (text_document_value) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const uri = switch (text_document_obj.get("uri") orelse return error.InvalidParams) {
+        .string => |s| s,
+        else => return error.InvalidParams,
+    };
+
+    const position_value = obj.get("position") orelse return error.InvalidParams;
+    const position_obj = switch (position_value) {
+        .object => |o| o,
+        else => return error.InvalidParams,
+    };
+
+    const line = switch (position_obj.get("line") orelse return error.InvalidParams) {
+        .integer => |i| @as(u32, @intCast(i)),
+        else => return error.InvalidParams,
+    };
+
+    const character = switch (position_obj.get("character") orelse return error.InvalidParams) {
+        .integer => |i| @as(u32, @intCast(i)),
+        else => return error.InvalidParams,
+    };
+
+    const new_name = switch (obj.get("newName") orelse return error.InvalidParams) {
+        .string => |s| s,
+        else => return error.InvalidParams,
+    };
+
+    return types.RenameParams{
+        .text_document = types.TextDocumentIdentifier{
+            .uri = uri,
+        },
+        .position = types.Position{
+            .line = line,
+            .character = character,
+        },
+        .new_name = new_name,
     };
 }
 

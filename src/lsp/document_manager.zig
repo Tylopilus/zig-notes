@@ -97,8 +97,14 @@ pub fn uriToPath(uri: []const u8) ![]const u8 {
 }
 
 pub fn pathToUri(path: []const u8) ![]const u8 {
-    // Simple path to URI conversion
-    const uri = try std.fmt.allocPrint(allocator, "file://{s}", .{path});
+    // Convert to absolute path first
+    const absolute_path = if (std.fs.path.isAbsolute(path)) 
+        try allocator.dupe(u8, path)
+    else 
+        try std.fs.cwd().realpathAlloc(allocator, path);
+    defer if (!std.fs.path.isAbsolute(path)) allocator.free(absolute_path);
+    
+    const uri = try std.fmt.allocPrint(allocator, "file://{s}", .{absolute_path});
     return uri;
 }
 

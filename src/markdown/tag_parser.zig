@@ -57,7 +57,7 @@ fn parseTagsFromFrontmatter(content: []const u8, tag_names: [][]const u8) ![]Tag
                         const array_content = line_content[array_start..tags_pos + bracket_end];
                         
                         try parseTagPositions(array_content, current_line, 
-                                            @as(u32, @intCast(line_start + array_start)), 
+                                            @as(u32, @intCast(array_start)), 
                                             tag_names, &tags);
                         found_tags_line = true;
                         break;
@@ -104,7 +104,11 @@ fn parseTagPositions(array_content: []const u8, line: u32, line_offset: u32,
         if (c == ',' or i == array_content.len - 1) {
             // End of current tag
             if (tag_start) |start| {
-                const end_pos = if (c == ',') pos else pos + 1;
+                // Find the actual end of the tag (skip trailing whitespace)
+                var actual_end = if (c == ',') pos else pos + 1;
+                while (actual_end > start and std.ascii.isWhitespace(array_content[actual_end - 1])) {
+                    actual_end -= 1;
+                }
                 
                 if (tag_index < tag_names.len) {
                     const tag = Tag{
@@ -112,7 +116,7 @@ fn parseTagPositions(array_content: []const u8, line: u32, line_offset: u32,
                         .position = types.Position{ .line = line, .character = line_offset + start },
                         .range = types.Range{
                             .start = types.Position{ .line = line, .character = line_offset + start },
-                            .end = types.Position{ .line = line, .character = line_offset + end_pos },
+                            .end = types.Position{ .line = line, .character = line_offset + actual_end },
                         },
                     };
                     try tags.append(tag);

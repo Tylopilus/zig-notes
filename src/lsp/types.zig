@@ -270,3 +270,43 @@ pub const ReferenceParams = struct {
 pub const ReferenceContext = struct {
     includeDeclaration: bool,
 };
+
+pub const RenameParams = struct {
+    text_document: TextDocumentIdentifier,
+    position: Position,
+    new_name: []const u8,
+};
+
+pub const WorkspaceEdit = struct {
+    changes: ?std.json.Value = null,
+    documentChanges: ?std.json.Value = null,
+};
+
+pub const ResourceOperation = union(enum) {
+    create: CreateFile,
+    rename: RenameFile,
+    delete: DeleteFile,
+};
+
+pub const CreateFile = struct {
+    uri: []const u8,
+};
+
+pub const RenameFile = struct {
+    oldUri: []const u8,
+    newUri: []const u8,
+};
+
+pub const DeleteFile = struct {
+    uri: []const u8,
+};
+
+pub const DocumentChange = union(enum) {
+    textDocumentEdit: TextDocumentEdit,
+    resourceOperation: ResourceOperation,
+};
+
+pub const TextDocumentEdit = struct {
+    textDocument: VersionedTextDocumentIdentifier,
+    edits: []TextEdit,
+};
