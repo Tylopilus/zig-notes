@@ -122,6 +122,11 @@ pub const FileIndex = struct {
             allocator.destroy(file_metadata);
         }
     }
+
+    pub fn renameFile(self: *FileIndex, old_path: []const u8, new_path: []const u8) !void {
+        self.removeFile(old_path);
+        try self.addFile(new_path);
+    }
 };
 
 test "file index basic operations" {

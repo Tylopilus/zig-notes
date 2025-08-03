@@ -120,7 +120,7 @@ pub const ServerCapabilities = struct {
     documentFormattingProvider: ?bool = null,
     documentRangeFormattingProvider: ?bool = null,
     documentOnTypeFormattingProvider: ?JsonValue = null,
-    renameProvider: ?bool = null,
+    renameProvider: ?RenameProvider = null,
     documentLinkProvider: ?JsonValue = null,
     executeCommandProvider: ?JsonValue = null,
     experimental: ?JsonValue = null,
@@ -282,6 +282,7 @@ pub const WorkspaceEdit = struct {
     documentChanges: ?std.json.Value = null,
 };
 
+
 pub const ResourceOperation = union(enum) {
     create: CreateFile,
     rename: RenameFile,
@@ -309,4 +310,13 @@ pub const DocumentChange = union(enum) {
 pub const TextDocumentEdit = struct {
     textDocument: VersionedTextDocumentIdentifier,
     edits: []TextEdit,
+};
+
+pub const PrepareRenameResult = struct {
+    range: Range,
+    placeholder: []const u8,
+};
+
+pub const RenameProvider = struct {
+    prepareProvider: ?bool = null,
 };

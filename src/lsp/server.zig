@@ -76,6 +76,8 @@ pub const LspServer = struct {
             try self.handleHover(writer, request);
         } else if (std.mem.eql(u8, request.method, "textDocument/references")) {
             try self.handleReferences(writer, request);
+        } else if (std.mem.eql(u8, request.method, "textDocument/prepareRename")) {
+            try self.handlePrepareRename(writer, request);
         } else if (std.mem.eql(u8, request.method, "textDocument/rename")) {
             try self.handleRename(writer, request);
         } else {
@@ -180,7 +182,9 @@ pub const LspServer = struct {
             .definitionProvider = true,
             .referencesProvider = true,
             .documentSymbolProvider = true,
-            .renameProvider = true,
+            .renameProvider = types.RenameProvider{ 
+                .prepareProvider = true 
+            },
         };
 
         const server_info = types.ServerInfo{
@@ -711,6 +715,43 @@ pub const LspServer = struct {
         }
     }
 
+    fn handlePrepareRename(self: *LspServer, writer: anytype, request: types.JsonRpcRequest) !void {
+        if (request.params) |params| {
+            if (parseDefinitionParams(params)) |prepare_params| {
+                if (self.document_manager.getDocument(prepare_params.text_document.uri)) |document| {
+                    // Check if cursor is on a tag
+                    if ((try self.getTagAtPosition(document.content, prepare_params.position))) |tag_name| {
+                        defer allocator.free(tag_name);
+                        
+                        const tag_range = try self.getTagRangeAtPosition(document.content, prepare_params.position);
+                        const prepare_result = types.PrepareRenameResult{
+                            .range = tag_range,
+                            .placeholder = tag_name,
+                        };
+                        try protocol.writeResponse(writer, request.id, prepare_result);
+                        return;
+                    } else if (self.document_manager.getWikilinkAtPosition(prepare_params.text_document.uri, prepare_params.position)) |wikilink| {
+                        // Return the range for the entire wikilink target
+                        const target_range = try self.getFullWikilinkTargetRange(wikilink.*);
+                        const prepare_result = types.PrepareRenameResult{
+                            .range = target_range,
+                            .placeholder = wikilink.target,
+                        };
+                        try protocol.writeResponse(writer, request.id, prepare_result);
+                        return;
+                    }
+                }
+            } else |err| {
+                std.log.warn("Failed to parse prepareRename params: {}", .{err});
+                try protocol.writeError(writer, request.id, -32602, "Invalid params");
+                return;
+            }
+        }
+        
+        // No renameable symbol found
+        try protocol.writeResponse(writer, request.id, null);
+    }
+
     fn handleRename(self: *LspServer, writer: anytype, request: types.JsonRpcRequest) !void {
         if (request.params) |params| {
             if (parseRenameParams(params)) |rename_params| {
@@ -733,117 +774,27 @@ pub const LspServer = struct {
                         try protocol.writeResponse(writer, request.id, workspace_edit);
                         return;
                     } else if (self.document_manager.getWikilinkAtPosition(rename_params.text_document.uri, rename_params.position)) |wikilink| {
-                        const old_path = try document_manager.uriToPath(rename_params.text_document.uri);
-                        defer allocator.free(old_path);
+                        // Rename wikilink targets across all markdown files
+                        const workspace_edit = try self.createWikilinkRename(wikilink.target, rename_params.new_name);
+                        
+                        // After creating the rename edit, also update the file index and markdown_files list
+                        if (self.file_index.resolveWikilink(wikilink.target)) |old_path| {
+                            const new_path = try self.buildNewFilePathFromTarget(old_path, rename_params.new_name);
+                            defer allocator.free(new_path);
+                            try self.file_index.renameFile(old_path, new_path);
 
-                        const new_path = try self.buildNewPath(old_path, rename_params.new_name);
-                        defer allocator.free(new_path);
-
-                        const referencing_files = self.link_graph.getFilesReferencingFile(old_path) orelse {
-                            try protocol.writeResponse(writer, request.id, null);
-                            return;
-                        };
-
-                        var changes = std.StringHashMap([]types.TextEdit).init(allocator);
-                        defer changes.deinit();
-
-                        var it = referencing_files.keyIterator();
-                        while (it.next()) |file_path_ptr| {
-                            const file_path = file_path_ptr.*;
-                            const file_content = std.fs.cwd().readFileAlloc(allocator, file_path, 1024 * 1024) catch |err| {
-                                std.log.warn("Failed to read file for rename: {s} - {}", .{ file_path, err });
-                                continue;
-                            };
-                            defer allocator.free(file_content);
-
-                            const wikilinks = parser.parseWikilinks(file_content) catch |err| {
-                                std.log.warn("Failed to parse wikilinks for rename: {s} - {}", .{ file_path, err });
-                                continue;
-                            };
-                            defer {
-                                for (wikilinks.items) |*link| link.deinit();
-                                wikilinks.deinit();
-                            }
-
-                            var edits = std.ArrayList(types.TextEdit).init(allocator);
-
-                            for (wikilinks.items) |link| {
-                                if (std.mem.eql(u8, link.target, wikilink.target)) {
-                                    const edit = types.TextEdit{
-                                        .range = link.range,
-                                        .newText = rename_params.new_name,
-                                    };
-                                    try edits.append(edit);
+                            // Update the main markdown_files list as well
+                            for (self.markdown_files.items) |*md_file| {
+                                if (std.mem.eql(u8, md_file.path, old_path)) {
+                                    const new_uri = try self.pathToUriSafe(new_path);
+                                    allocator.free(md_file.path);
+                                    allocator.free(md_file.uri);
+                                    md_file.path = try allocator.dupe(u8, new_path);
+                                    md_file.uri = new_uri;
+                                    break; 
                                 }
                             }
-
-                            const file_uri = try document_manager.pathToUri(file_path);
-                            defer allocator.free(file_uri);
-                            try changes.put(file_uri, try edits.toOwnedSlice());
                         }
-
-                        var json_changes = std.json.ObjectMap.init(allocator);
-                        var changes_it = changes.iterator();
-                        while (changes_it.next()) |entry| {
-                            const uri = entry.key_ptr.*;
-                            const edits_array = entry.value_ptr.*;
-
-                            var json_edits = std.json.Array.init(allocator);
-                            for (edits_array) |edit| {
-                                var edit_obj = std.json.ObjectMap.init(allocator);
-                                defer edit_obj.deinit();
-
-                                var range_obj = std.json.ObjectMap.init(allocator);
-                                defer range_obj.deinit();
-
-                                var start_pos_obj = std.json.ObjectMap.init(allocator);
-                                defer start_pos_obj.deinit();
-                                try start_pos_obj.put("line", .{ .integer = @as(i64, edit.range.start.line) });
-                                try start_pos_obj.put("character", .{ .integer = @as(i64, edit.range.start.character) });
-
-                                var end_pos_obj = std.json.ObjectMap.init(allocator);
-                                defer end_pos_obj.deinit();
-                                try end_pos_obj.put("line", .{ .integer = @as(i64, edit.range.end.line) });
-                                try end_pos_obj.put("character", .{ .integer = @as(i64, edit.range.end.character) });
-
-                                try range_obj.put("start", .{ .object = start_pos_obj });
-                                try range_obj.put("end", .{ .object = end_pos_obj });
-
-                                try edit_obj.put("range", .{ .object = range_obj });
-                                try edit_obj.put("newText", .{ .string = edit.newText });
-
-                                try json_edits.append(.{ .object = edit_obj });
-                            }
-                            try json_changes.put(uri, .{ .array = json_edits });
-                        }
-
-                        var json_document_changes = std.json.Array.init(allocator);
-                        defer json_document_changes.deinit();
-
-                        const old_uri = try document_manager.pathToUri(old_path);
-                        defer allocator.free(old_uri);
-                        const new_uri = try document_manager.pathToUri(new_path);
-                        defer allocator.free(new_uri);
-
-                        var rename_op_obj = std.json.ObjectMap.init(allocator);
-                        defer rename_op_obj.deinit();
-                        try rename_op_obj.put("oldUri", .{ .string = old_uri });
-                        try rename_op_obj.put("newUri", .{ .string = new_uri });
-
-                        var resource_op_obj = std.json.ObjectMap.init(allocator);
-                        defer resource_op_obj.deinit();
-                        try resource_op_obj.put("rename", .{ .object = rename_op_obj });
-
-                        var doc_change_obj = std.json.ObjectMap.init(allocator);
-                        defer doc_change_obj.deinit();
-                        try doc_change_obj.put("resourceOperation", .{ .object = resource_op_obj });
-
-                        try json_document_changes.append(.{ .object = doc_change_obj });
-
-                        const workspace_edit = types.WorkspaceEdit{
-                            .changes = .{ .object = json_changes },
-                            .documentChanges = .{ .array = json_document_changes },
-                        };
 
                         try protocol.writeResponse(writer, request.id, workspace_edit);
                         return;
@@ -1049,6 +1000,211 @@ pub const LspServer = struct {
         
         return types.WorkspaceEdit{
             .changes = .{ .object = empty_changes },
+        };
+    }
+
+    fn createWikilinkRename(self: *LspServer, old_target: []const u8, new_target: []const u8) !types.WorkspaceEdit {
+        var document_changes = std.json.Array.init(allocator);
+
+        // 1. Create file rename operation
+        if (self.file_index.resolveWikilink(old_target)) |old_path| {
+            const new_path = try self.buildNewFilePathFromTarget(old_path, new_target);
+            defer allocator.free(new_path);
+
+            const old_uri = try self.pathToUriSafe(old_path);
+            const new_uri = try self.pathToUriSafe(new_path);
+
+            var rename_op = std.json.ObjectMap.init(allocator);
+            try rename_op.put("kind", .{ .string = "rename" });
+            try rename_op.put("oldUri", .{ .string = old_uri });
+            try rename_op.put("newUri", .{ .string = new_uri });
+
+            try document_changes.append(.{ .object = rename_op });
+        }
+
+        // 2. Create text edits for all references
+        for (self.markdown_files.items) |md_file| {
+            const file_content = std.fs.cwd().readFileAlloc(allocator, md_file.path, 1024 * 1024) catch |err| {
+                std.log.warn("Failed to read file for wikilink rename: {s} - {}", .{ md_file.path, err });
+                continue;
+            };
+            defer allocator.free(file_content);
+
+            const wikilinks = parser.parseWikilinks(file_content) catch |err| {
+                std.log.warn("Failed to parse wikilinks for rename: {s} - {}", .{ md_file.path, err });
+                continue;
+            };
+            defer {
+                for (wikilinks.items) |*link| link.deinit();
+                wikilinks.deinit();
+            }
+
+            var edits_array = std.json.Array.init(allocator);
+            var has_edits = false;
+
+            for (wikilinks.items) |link| {
+                if (std.mem.eql(u8, link.target, old_target)) {
+                    var edit_obj = std.json.ObjectMap.init(allocator);
+                    var range_obj = std.json.ObjectMap.init(allocator);
+                    var start_obj = std.json.ObjectMap.init(allocator);
+                    var end_obj = std.json.ObjectMap.init(allocator);
+
+                    const target_range = try self.getFullWikilinkTargetRange(link);
+
+                    try start_obj.put("line", .{ .integer = @as(i64, @intCast(target_range.start.line)) });
+                    try start_obj.put("character", .{ .integer = @as(i64, @intCast(target_range.start.character)) });
+                    try end_obj.put("line", .{ .integer = @as(i64, @intCast(target_range.end.line)) });
+                    try end_obj.put("character", .{ .integer = @as(i64, @intCast(target_range.end.character)) });
+
+                    try range_obj.put("start", .{ .object = start_obj });
+                    try range_obj.put("end", .{ .object = end_obj });
+
+                    try edit_obj.put("range", .{ .object = range_obj });
+
+                    const new_wikilink_target = try self.computeNewWikilinkTarget(link.target, new_target);
+                    try edit_obj.put("newText", .{ .string = new_wikilink_target });
+
+                    try edits_array.append(.{ .object = edit_obj });
+                    has_edits = true;
+                }
+            }
+
+            if (has_edits) {
+                const file_uri = try self.pathToUriSafe(md_file.path);
+                
+                var text_doc_id = std.json.ObjectMap.init(allocator);
+                try text_doc_id.put("uri", .{ .string = file_uri });
+                try text_doc_id.put("version", .null);
+
+                var text_doc_edit = std.json.ObjectMap.init(allocator);
+                try text_doc_edit.put("textDocument", .{ .object = text_doc_id });
+                try text_doc_edit.put("edits", .{ .array = edits_array });
+
+                try document_changes.append(.{ .object = text_doc_edit });
+            } else {
+                edits_array.deinit();
+            }
+        }
+
+        return types.WorkspaceEdit{
+            .changes = null,
+            .documentChanges = .{ .array = document_changes },
+        };
+    }
+
+    fn buildNewFilePathFromTarget(self: *LspServer, old_file_path: []const u8, new_target: []const u8) ![]const u8 {
+        _ = self;
+        const dir = std.fs.path.dirname(old_file_path) orelse ".";
+        const old_ext = std.fs.path.extension(old_file_path);
+        
+        // Check if the new_target already has an extension
+        const new_target_ext = std.fs.path.extension(new_target);
+        
+        if (new_target_ext.len > 0) {
+            // User provided a full filename with extension, use it as-is
+            return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, new_target });
+        } else {
+            // User provided just a name, add the extension from the old file
+            const clean_ext = if (old_ext.len > 0 and old_ext[0] == '.') old_ext[1..] else old_ext;
+            if (clean_ext.len > 0) {
+                return try std.fmt.allocPrint(allocator, "{s}/{s}.{s}", .{ dir, new_target, clean_ext });
+            } else {
+                return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, new_target });
+            }
+        }
+    }
+
+    fn pathToUriSafe(self: *LspServer, path: []const u8) ![]const u8 {
+        _ = self;
+        // Convert to absolute path first, but handle non-existent files safely
+        const absolute_path = if (std.fs.path.isAbsolute(path)) 
+            try allocator.dupe(u8, path)
+        else blk: {
+            // For relative paths, convert them to absolute without requiring the file to exist
+            const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+            defer allocator.free(cwd);
+            const joined_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, path });
+            // Resolve any ./ or ../ in the path
+            const resolved_path = try std.fs.path.resolve(allocator, &[_][]const u8{joined_path});
+            allocator.free(joined_path);
+            break :blk resolved_path;
+        };
+        defer allocator.free(absolute_path);
+        
+        const uri = try std.fmt.allocPrint(allocator, "file://{s}", .{absolute_path});
+        return uri;
+    }
+
+    fn computeNewWikilinkTarget(self: *LspServer, old_wikilink_target: []const u8, new_filename: []const u8) ![]const u8 {
+        _ = self;
+        
+        // Check if the original wikilink target had an extension
+        const old_has_extension = std.mem.indexOf(u8, old_wikilink_target, ".") != null;
+        
+        // Check if the new filename has an extension
+        const new_has_extension = std.mem.indexOf(u8, new_filename, ".") != null;
+        
+        if (old_has_extension) {
+            // Original had extension, keep the new filename as-is (with or without extension)
+            if (new_has_extension) {
+                // Both have extensions: "2.md" + "new.md" → "new.md"
+                return try allocator.dupe(u8, new_filename);
+            } else {
+                // Original had extension, new doesn't: "2.md" + "new" → "new.md"
+                const old_ext = std.fs.path.extension(old_wikilink_target);
+                const clean_ext = if (old_ext.len > 0 and old_ext[0] == '.') old_ext[1..] else old_ext;
+                if (clean_ext.len > 0) {
+                    return try std.fmt.allocPrint(allocator, "{s}.{s}", .{ new_filename, clean_ext });
+                } else {
+                    return try allocator.dupe(u8, new_filename);
+                }
+            }
+        } else {
+            // Original had no extension, use bare name
+            if (new_has_extension) {
+                // Original was bare, new has extension: "2" + "new.md" → "new"
+                const basename = std.fs.path.stem(new_filename);
+                return try allocator.dupe(u8, basename);
+            } else {
+                // Both are bare: "2" + "new" → "new"
+                return try allocator.dupe(u8, new_filename);
+            }
+        }
+    }
+
+    fn getFullWikilinkTargetRange(self: *LspServer, wikilink: parser.WikiLink) !types.Range {
+        _ = self;
+        // For wikilinks, always select the entire target part regardless of cursor position
+        // Target starts after [[ and ends before | (if alias) or ]] (if no alias)
+        var target_start = wikilink.range.start;
+        target_start.character += 2; // Skip [[
+        
+        const target_end = types.Position{
+            .line = target_start.line,
+            .character = target_start.character + @as(u32, @intCast(wikilink.target.len)),
+        };
+        
+        return types.Range{
+            .start = target_start,
+            .end = target_end,
+        };
+    }
+
+    fn getWikilinkTargetRange(self: *LspServer, wikilink: parser.WikiLink) !types.Range {
+        _ = self;
+        // For wikilinks, the target is from the start position + 2 (skip [[) 
+        // until either the end of the target text or the pipe character (if alias exists)
+        var target_start = wikilink.range.start;
+        target_start.character += 2; // Skip [[
+        
+        const target_end = types.Position{
+            .line = target_start.line,
+            .character = target_start.character + @as(u32, @intCast(wikilink.target.len)),
+        };
+        
+        return types.Range{
+            .start = target_start,
+            .end = target_end,
         };
     }
 
@@ -1711,3 +1867,4 @@ fn parseDidSaveParams(params: std.json.Value) !types.DidSaveTextDocumentParams {
         .text = null, // We don't expect text in the save params for our use case
     };
 }
+

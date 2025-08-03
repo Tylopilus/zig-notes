@@ -49,7 +49,13 @@ fn walkDirectory(dir_path: []const u8, files: *std.ArrayList(MarkdownFile)) !voi
         } else if (entry.kind == .file) {
             if (std.mem.endsWith(u8, entry.name, ".md")) {
                 const full_path = try std.fs.path.join(allocator, &[_][]const u8{ dir_path, entry.name });
-                const uri = try std.fmt.allocPrint(allocator, "file://{s}", .{full_path});
+                // Convert to absolute path for URI
+                const absolute_path = if (std.fs.path.isAbsolute(full_path))
+                    try allocator.dupe(u8, full_path)
+                else
+                    try std.fs.cwd().realpathAlloc(allocator, full_path);
+                defer allocator.free(absolute_path);
+                const uri = try std.fmt.allocPrint(allocator, "file://{s}", .{absolute_path});
 
                 try files.append(MarkdownFile{
                     .path = full_path,
